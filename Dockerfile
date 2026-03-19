@@ -10,6 +10,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
-RUN mkdir -p reference_images
+COPY reference_images/ ./reference_images/
 
 CMD ["python", "bot.py"]
