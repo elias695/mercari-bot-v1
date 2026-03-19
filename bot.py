@@ -8,6 +8,7 @@ from datetime import datetime
 from PIL import Image
 import imagehash
 from io import BytesIO
+import random
  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
@@ -18,6 +19,22 @@ SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "15"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
 REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
 SEEN_FILE        = Path("seen_items.json")
+ 
+# ── Proxy config ─────────────────────────────────────────────────────────────
+# Webshare free proxies with JP IPs — set via Railway env vars
+PROXY_HOST = os.getenv("PROXY_HOST", "")
+PROXY_PORT = os.getenv("PROXY_PORT", "")
+PROXY_USER = os.getenv("PROXY_USER", "")
+PROXY_PASS = os.getenv("PROXY_PASS", "")
+ 
+def get_proxies():
+    if PROXY_HOST and PROXY_PORT:
+        if PROXY_USER and PROXY_PASS:
+            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        else:
+            proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
+        return {"http": proxy_url, "https": proxy_url}
+    return None
  
 KEYWORDS = [
     "ナイキ ランニング",
@@ -39,13 +56,12 @@ def load_reference_hashes() -> list:
     REFERENCE_DIR.mkdir(exist_ok=True)
     files = list(REFERENCE_DIR.glob("*.jpg")) + list(REFERENCE_DIR.glob("*.jpeg")) + list(REFERENCE_DIR.glob("*.png"))
     if not files:
-        log.warning(f"Aucune image de reference dans '{REFERENCE_DIR}/'")
+        log.warning("Aucune image de reference")
         return refs
     for f in files:
         try:
             img = Image.open(f).convert("RGB")
-            h = imagehash.phash(img)
-            refs.append({"path": str(f), "hash": h})
+            refs.append({"path": str(f), "hash": imagehash.phash(img)})
         except Exception as e:
             log.warning(f"Erreur {f}: {e}")
     log.info(f"{len(refs)} hashes charges.")
@@ -63,49 +79,22 @@ def is_similar(item_img, refs, threshold):
     if not refs:
         return False, 99, ""
     item_hash = imagehash.phash(item_img)
-    best_dist = 999
-    best_ref = ""
+    best_dist, best_ref = 999, ""
     for ref in refs:
         dist = item_hash - ref["hash"]
         if dist < best_dist:
-            best_dist = dist
-            best_ref = ref["path"]
+            best_dist, best_ref = dist, ref["path"]
     return best_dist <= threshold, best_dist, best_ref
  
-def get_mercari_token(session: requests.Session) -> str:
-    """Get CSRF/auth token from Mercari JP homepage."""
-    try:
-        r = session.get("https://jp.mercari.com/", timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "ja-JP,ja;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
-        # Extract dpop or auth token if present
-        return ""
-    except:
-        return ""
- 
 def search_mercari(session: requests.Session, keyword: str, limit: int = 30) -> list:
-    """Search using Mercari's search endpoint with proper session cookies."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "ja-JP,ja;q=0.9",
         "Origin": "https://jp.mercari.com",
         "Referer": f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale",
         "X-Platform": "web",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
     }
-    
-    # Try v2 search endpoint
-    endpoints = [
-        "https://api.mercari.jp/search_index/search",
-        "https://api.mercari.jp/v2/search_index/search",
-    ]
-    
     params = {
         "keyword": keyword,
         "limit": limit,
@@ -113,50 +102,33 @@ def search_mercari(session: requests.Session, keyword: str, limit: int = 30) -> 
         "sort": "created_time",
         "order": "desc",
         "status": "on_sale",
-        "t__time": int(time.time()),
     }
-    
-    for url in endpoints:
-        try:
-            r = session.get(url, headers=headers, params=params, timeout=15)
-            if r.status_code == 200:
-                items = r.json().get("items", [])
-                log.info(f"  '{keyword}' -> {len(items)} articles")
-                return items
-            elif r.status_code == 401:
-                log.warning(f"  '{keyword}' -> 401 (endpoint {url})")
-        except Exception as e:
-            log.warning(f"Erreur '{keyword}': {e}")
-    
-    # Fallback: scrape search page HTML and parse JSON embedded
+    proxies = get_proxies()
     try:
-        search_url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale&sort=created_time&order=desc"
-        r = session.get(search_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "ja-JP,ja;q=0.9",
-        }, timeout=15)
-        
+        r = session.get(
+            "https://api.mercari.jp/search_index/search",
+            headers=headers,
+            params=params,
+            proxies=proxies,
+            timeout=20
+        )
         if r.status_code == 200:
-            # Try to find JSON data embedded in the page
-            import re
-            # Look for __NEXT_DATA__ or similar
-            match = re.search(r'"items"\s*:\s*(\[.*?\])', r.text, re.DOTALL)
-            if match:
-                items = json.loads(match.group(1))
-                log.info(f"  '{keyword}' (HTML) -> {len(items)} articles")
-                return items
-        log.warning(f"  '{keyword}' -> scraping echoue (status {r.status_code})")
+            items = r.json().get("items", [])
+            log.info(f"  '{keyword}' -> {len(items)} articles ✅")
+            return items
+        else:
+            log.warning(f"  '{keyword}' -> HTTP {r.status_code}")
+            return []
     except Exception as e:
-        log.warning(f"  '{keyword}' -> scraping erreur: {e}")
-    
-    return []
+        log.warning(f"  '{keyword}' -> erreur: {e}")
+        return []
  
 def item_info(item):
     return {
         "id": item.get("id", ""),
         "name": item.get("name", ""),
         "price": item.get("price", 0),
-        "image_url": (item.get("thumbnails") or [None])[0] or item.get("photo", {}).get("image_url", ""),
+        "image_url": (item.get("thumbnails") or [None])[0] or "",
         "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
     }
  
@@ -180,7 +152,6 @@ def notify(item, dist, ref_path, keyword):
         f"💴 <b>{item['price']:,} ¥</b>\n"
         f"🔍 Mot-cle : <code>{keyword}</code>\n"
         f"📊 Similarite : <b>{score_pct}%</b>\n"
-        f"🖼 Reference : <code>{Path(ref_path).name if ref_path else 'N/A'}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>"
     )
     log.info(f"  -> MATCH {item['name']} (dist={dist})")
@@ -190,26 +161,17 @@ def run():
     log.info("=== Mercari JP Bot demarre ===")
     refs = load_reference_hashes()
     seen = load_seen()
+    proxies = get_proxies()
     
-    # Create persistent session (keeps cookies between requests)
     session = requests.Session()
     
-    # Visit homepage first to get cookies
-    log.info("Initialisation session Mercari JP...")
-    try:
-        session.get("https://jp.mercari.com/", timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "ja-JP,ja;q=0.9",
-        })
-        log.info("Session initialisee.")
-    except Exception as e:
-        log.warning(f"Init session: {e}")
- 
+    proxy_status = f"🌐 Proxy: {'Oui ✅' if proxies else 'Non ❌ (risque blocage)'}"
     send_telegram(
         f"✅ <b>Bot demarre !</b>\n"
         f"📸 {len(refs)} images de reference\n"
-        f"🔎 {len(KEYWORDS)} mots-cles surveilles\n"
-        f"⏱ Scan toutes les {SCAN_INTERVAL // 60} min"
+        f"🔎 {len(KEYWORDS)} mots-cles\n"
+        f"⏱ Scan toutes les {SCAN_INTERVAL // 60} min\n"
+        f"{proxy_status}"
     )
  
     scan_count = 0
@@ -217,18 +179,8 @@ def run():
         scan_count += 1
         log.info(f"--- Scan #{scan_count} {datetime.now().strftime('%H:%M:%S')} ---")
         refs = load_reference_hashes()
-        
-        # Refresh session every 10 scans
-        if scan_count % 10 == 0:
-            try:
-                session.get("https://jp.mercari.com/", timeout=15, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                    "Accept-Language": "ja-JP,ja;q=0.9",
-                })
-            except:
-                pass
- 
         total_found = 0
+ 
         for keyword in KEYWORDS:
             items = search_mercari(session, keyword)
             total_found += len(items)
@@ -248,12 +200,15 @@ def run():
                     notify(info, dist, ref_path, keyword)
             time.sleep(3)
  
-        # Alert if still getting 0 results (API still blocked)
         if total_found == 0 and scan_count % 5 == 0:
-            send_telegram("⚠️ <b>Attention</b> : 0 articles trouvés sur Mercari JP. L'API est peut-être bloquée.")
+            send_telegram(
+                f"⚠️ <b>0 articles trouves</b> (scan #{scan_count})\n"
+                f"Proxy actif : {'Oui' if proxies else 'Non'}\n"
+                f"Configure PROXY_HOST/PORT/USER/PASS dans Railway Variables si besoin."
+            )
  
         save_seen(seen)
-        log.info(f"Total articles trouves ce scan: {total_found} | Prochain scan dans {SCAN_INTERVAL}s...")
+        log.info(f"Total: {total_found} articles | Prochain scan dans {SCAN_INTERVAL}s...")
         time.sleep(SCAN_INTERVAL)
  
 if __name__ == "__main__":
