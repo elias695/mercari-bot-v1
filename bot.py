@@ -2,13 +2,14 @@ import os
 import time
 import json
 import logging
-import requests
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
 import imagehash
+import requests
 from io import BytesIO
-import random
+import mercari as mercari_api
+from mercari import MercariSearchStatus, MercariSort, MercariOrder
  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
@@ -19,22 +20,6 @@ SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "15"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
 REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
 SEEN_FILE        = Path("seen_items.json")
- 
-# ── Proxy config ─────────────────────────────────────────────────────────────
-# Webshare free proxies with JP IPs — set via Railway env vars
-PROXY_HOST = os.getenv("PROXY_HOST", "")
-PROXY_PORT = os.getenv("PROXY_PORT", "")
-PROXY_USER = os.getenv("PROXY_USER", "")
-PROXY_PASS = os.getenv("PROXY_PASS", "")
- 
-def get_proxies():
-    if PROXY_HOST and PROXY_PORT:
-        if PROXY_USER and PROXY_PASS:
-            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-        else:
-            proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
-        return {"http": proxy_url, "https": proxy_url}
-    return None
  
 KEYWORDS = [
     "ナイキ ランニング",
@@ -86,51 +71,30 @@ def is_similar(item_img, refs, threshold):
             best_dist, best_ref = dist, ref["path"]
     return best_dist <= threshold, best_dist, best_ref
  
-def search_mercari(session: requests.Session, keyword: str, limit: int = 30) -> list:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ja-JP,ja;q=0.9",
-        "Origin": "https://jp.mercari.com",
-        "Referer": f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale",
-        "X-Platform": "web",
-    }
-    params = {
-        "keyword": keyword,
-        "limit": limit,
-        "offset": 0,
-        "sort": "created_time",
-        "order": "desc",
-        "status": "on_sale",
-    }
-    proxies = get_proxies()
+def search_keyword(keyword: str, max_items: int = 30) -> list:
+    results = []
     try:
-        r = session.get(
-            "https://api.mercari.jp/search_index/search",
-            headers=headers,
-            params=params,
-            proxies=proxies,
-            timeout=20
-        )
-        if r.status_code == 200:
-            items = r.json().get("items", [])
-            log.info(f"  '{keyword}' -> {len(items)} articles ✅")
-            return items
-        else:
-            log.warning(f"  '{keyword}' -> HTTP {r.status_code}")
-            return []
+        count = 0
+        for item in mercari_api.search(
+            keyword,
+            sort=MercariSort.SORT_CREATED_TIME,
+            order=MercariOrder.ORDER_DESC,
+            status=MercariSearchStatus.ON_SALE,
+        ):
+            results.append({
+                "id": item.id,
+                "name": item.productName,
+                "price": item.price,
+                "image_url": item.imageURL,
+                "url": item.productURL,
+            })
+            count += 1
+            if count >= max_items:
+                break
+        log.info(f"  '{keyword}' -> {len(results)} articles ✅")
     except Exception as e:
         log.warning(f"  '{keyword}' -> erreur: {e}")
-        return []
- 
-def item_info(item):
-    return {
-        "id": item.get("id", ""),
-        "name": item.get("name", ""),
-        "price": item.get("price", 0),
-        "image_url": (item.get("thumbnails") or [None])[0] or "",
-        "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
-    }
+    return results
  
 def send_telegram(text, image_url=""):
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -161,17 +125,13 @@ def run():
     log.info("=== Mercari JP Bot demarre ===")
     refs = load_reference_hashes()
     seen = load_seen()
-    proxies = get_proxies()
-    
-    session = requests.Session()
-    
-    proxy_status = f"🌐 Proxy: {'Oui ✅' if proxies else 'Non ❌ (risque blocage)'}"
+ 
     send_telegram(
         f"✅ <b>Bot demarre !</b>\n"
         f"📸 {len(refs)} images de reference\n"
         f"🔎 {len(KEYWORDS)} mots-cles\n"
         f"⏱ Scan toutes les {SCAN_INTERVAL // 60} min\n"
-        f"{proxy_status}"
+        f"🔑 Auth: JWT auto ✅"
     )
  
     scan_count = 0
@@ -182,10 +142,9 @@ def run():
         total_found = 0
  
         for keyword in KEYWORDS:
-            items = search_mercari(session, keyword)
+            items = search_keyword(keyword, max_items=30)
             total_found += len(items)
-            for raw in items:
-                info = item_info(raw)
+            for info in items:
                 if not info["id"] or info["id"] in seen:
                     continue
                 seen.add(info["id"])
@@ -199,13 +158,6 @@ def run():
                 if matched:
                     notify(info, dist, ref_path, keyword)
             time.sleep(3)
- 
-        if total_found == 0 and scan_count % 5 == 0:
-            send_telegram(
-                f"⚠️ <b>0 articles trouves</b> (scan #{scan_count})\n"
-                f"Proxy actif : {'Oui' if proxies else 'Non'}\n"
-                f"Configure PROXY_HOST/PORT/USER/PASS dans Railway Variables si besoin."
-            )
  
         save_seen(seen)
         log.info(f"Total: {total_found} articles | Prochain scan dans {SCAN_INTERVAL}s...")
