@@ -41,7 +41,6 @@ def load_reference_hashes() -> list:
     if not files:
         log.warning(f"Aucune image de reference dans '{REFERENCE_DIR}/'")
         return refs
-    log.info(f"Chargement de {len(files)} images...")
     for f in files:
         try:
             img = Image.open(f).convert("RGB")
@@ -54,7 +53,7 @@ def load_reference_hashes() -> list:
  
 def fetch_image(url: str):
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         return Image.open(BytesIO(r.content)).convert("RGB")
     except:
@@ -73,34 +72,91 @@ def is_similar(item_img, refs, threshold):
             best_ref = ref["path"]
     return best_dist <= threshold, best_dist, best_ref
  
-MERCARI_URL = "https://api.mercari.jp/search_index/search"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
-    "Accept": "application/json",
-    "Accept-Language": "ja-JP,ja;q=0.9",
-    "Origin": "https://jp.mercari.com",
-    "Referer": "https://jp.mercari.com/",
-    "X-Platform": "web",
-}
- 
-def search_mercari(keyword, limit=30):
-    params = {"keyword": keyword, "limit": limit, "offset": 0, "sort": "created_time", "order": "desc", "status": "on_sale"}
+def get_mercari_token(session: requests.Session) -> str:
+    """Get CSRF/auth token from Mercari JP homepage."""
     try:
-        r = requests.get(MERCARI_URL, headers=HEADERS, params=params, timeout=15)
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        log.info(f"  '{keyword}' -> {len(items)} articles")
-        return items
+        r = session.get("https://jp.mercari.com/", timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        # Extract dpop or auth token if present
+        return ""
+    except:
+        return ""
+ 
+def search_mercari(session: requests.Session, keyword: str, limit: int = 30) -> list:
+    """Search using Mercari's search endpoint with proper session cookies."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://jp.mercari.com",
+        "Referer": f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale",
+        "X-Platform": "web",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
+    
+    # Try v2 search endpoint
+    endpoints = [
+        "https://api.mercari.jp/search_index/search",
+        "https://api.mercari.jp/v2/search_index/search",
+    ]
+    
+    params = {
+        "keyword": keyword,
+        "limit": limit,
+        "offset": 0,
+        "sort": "created_time",
+        "order": "desc",
+        "status": "on_sale",
+        "t__time": int(time.time()),
+    }
+    
+    for url in endpoints:
+        try:
+            r = session.get(url, headers=headers, params=params, timeout=15)
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                log.info(f"  '{keyword}' -> {len(items)} articles")
+                return items
+            elif r.status_code == 401:
+                log.warning(f"  '{keyword}' -> 401 (endpoint {url})")
+        except Exception as e:
+            log.warning(f"Erreur '{keyword}': {e}")
+    
+    # Fallback: scrape search page HTML and parse JSON embedded
+    try:
+        search_url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale&sort=created_time&order=desc"
+        r = session.get(search_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9",
+        }, timeout=15)
+        
+        if r.status_code == 200:
+            # Try to find JSON data embedded in the page
+            import re
+            # Look for __NEXT_DATA__ or similar
+            match = re.search(r'"items"\s*:\s*(\[.*?\])', r.text, re.DOTALL)
+            if match:
+                items = json.loads(match.group(1))
+                log.info(f"  '{keyword}' (HTML) -> {len(items)} articles")
+                return items
+        log.warning(f"  '{keyword}' -> scraping echoue (status {r.status_code})")
     except Exception as e:
-        log.warning(f"Erreur Mercari '{keyword}': {e}")
-        return []
+        log.warning(f"  '{keyword}' -> scraping erreur: {e}")
+    
+    return []
  
 def item_info(item):
     return {
         "id": item.get("id", ""),
         "name": item.get("name", ""),
         "price": item.get("price", 0),
-        "image_url": (item.get("thumbnails") or [None])[0] or "",
+        "image_url": (item.get("thumbnails") or [None])[0] or item.get("photo", {}).get("image_url", ""),
         "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
     }
  
@@ -134,17 +190,48 @@ def run():
     log.info("=== Mercari JP Bot demarre ===")
     refs = load_reference_hashes()
     seen = load_seen()
+    
+    # Create persistent session (keeps cookies between requests)
+    session = requests.Session()
+    
+    # Visit homepage first to get cookies
+    log.info("Initialisation session Mercari JP...")
+    try:
+        session.get("https://jp.mercari.com/", timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9",
+        })
+        log.info("Session initialisee.")
+    except Exception as e:
+        log.warning(f"Init session: {e}")
+ 
     send_telegram(
         f"✅ <b>Bot demarre !</b>\n"
         f"📸 {len(refs)} images de reference\n"
         f"🔎 {len(KEYWORDS)} mots-cles surveilles\n"
         f"⏱ Scan toutes les {SCAN_INTERVAL // 60} min"
     )
+ 
+    scan_count = 0
     while True:
-        log.info(f"--- Scan {datetime.now().strftime('%H:%M:%S')} ---")
+        scan_count += 1
+        log.info(f"--- Scan #{scan_count} {datetime.now().strftime('%H:%M:%S')} ---")
         refs = load_reference_hashes()
+        
+        # Refresh session every 10 scans
+        if scan_count % 10 == 0:
+            try:
+                session.get("https://jp.mercari.com/", timeout=15, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                    "Accept-Language": "ja-JP,ja;q=0.9",
+                })
+            except:
+                pass
+ 
+        total_found = 0
         for keyword in KEYWORDS:
-            items = search_mercari(keyword)
+            items = search_mercari(session, keyword)
+            total_found += len(items)
             for raw in items:
                 info = item_info(raw)
                 if not info["id"] or info["id"] in seen:
@@ -159,9 +246,14 @@ def run():
                 matched, dist, ref_path = is_similar(img, refs, SIMILARITY_THRESHOLD)
                 if matched:
                     notify(info, dist, ref_path, keyword)
-            time.sleep(2)
+            time.sleep(3)
+ 
+        # Alert if still getting 0 results (API still blocked)
+        if total_found == 0 and scan_count % 5 == 0:
+            send_telegram("⚠️ <b>Attention</b> : 0 articles trouvés sur Mercari JP. L'API est peut-être bloquée.")
+ 
         save_seen(seen)
-        log.info(f"Prochain scan dans {SCAN_INTERVAL}s...")
+        log.info(f"Total articles trouves ce scan: {total_found} | Prochain scan dans {SCAN_INTERVAL}s...")
         time.sleep(SCAN_INTERVAL)
  
 if __name__ == "__main__":
