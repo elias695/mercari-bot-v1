@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Bot runtime (ne pas committer)
+seen_items.json
+
+# Garder les images de référence dans Git !
+# (ne pas mettre reference_images/ ici)
