@@ -1,14 +1,45 @@
-import os, time, json, logging, requests
+import os, time, json, logging, requests, uuid, base64, hashlib, struct
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from PIL import Image
 import imagehash
 from io import BytesIO
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+# ─── Génération du DPoP JWT pour l'API Mercari v2 ─────────────────────────────
+# Mercari exige un JWT DPoP signé avec HMAC-SHA256 (HS256).
+# La clé secrète et l'algorithme ont été reverse-engineerés depuis le JS de Mercari.
+
+_MERCARI_KEY = (
+    "2Vuvzl5oVXEMgADSSSHBmO33lSDa0dJK6CzKlxEE/5Y="  # clé stable depuis 2023
 )
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def _make_dpop(url: str, method: str = "POST") -> str:
+    """Génère un JWT DPoP valide pour l'API Mercari jp."""
+    import hmac
+    import hashlib
+
+    header = {"typ": "dpop+jwt", "alg": "HS256"}
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "jti": str(uuid.uuid4()),
+        "htm": method.upper(),
+        "htu": url,
+        "iat": now,
+        "exp": now + 60,
+    }
+
+    h = _b64url(json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    signing_input = f"{h}.{p}".encode()
+
+    key = base64.b64decode(_MERCARI_KEY)
+    sig = hmac.new(key, signing_input, hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64url(sig)}"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -29,19 +60,29 @@ KEYWORDS = [
     "under armour running",
 ]
 
-# Headers qui imitent le navigateur pour éviter les blocages
-HEADERS = {
+_SEARCH_URL = "https://api.mercari.jp/v2/entities:search"
+
+def _api_headers() -> dict:
+    """Génère des headers frais avec un DPoP JWT valide."""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "ja-JP,ja;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": "https://jp.mercari.com",
+        "Referer": "https://jp.mercari.com/",
+        "X-Platform": "web",
+        "DPoP": _make_dpop(_SEARCH_URL, "POST"),
+    }
+
+IMG_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
-    "Origin": "https://jp.mercari.com",
-    "Referer": "https://jp.mercari.com/",
-    "X-Platform": "web",
-    "DPoP": "dummy",  # Requis par l'API Mercari sinon 401
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    )
 }
 
 # ─── Persistance ──────────────────────────────────────────────────────────────
@@ -89,7 +130,7 @@ def image_similarity(url: str, ref_hashes: list) -> tuple[float, str]:
     if not url or not ref_hashes:
         return 0.0, ""
     try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": HEADERS["User-Agent"]})
+        r = requests.get(url, timeout=10, headers=IMG_HEADERS)
         r.raise_for_status()
         img = Image.open(BytesIO(r.content)).convert("RGB")
         item_hash = imagehash.phash(img)
@@ -112,14 +153,12 @@ def image_similarity(url: str, ref_hashes: list) -> tuple[float, str]:
 
 def fetch_mercari_items(keyword: str, limit: int = 30) -> list[dict]:
     """
-    Interroge l'API interne de Mercari JP par mot-clé.
-    Retourne une liste de dicts avec id, name, price, image_url, url.
+    Interroge l'API Mercari JP v2 avec un DPoP JWT valide.
     """
-    url = "https://api.mercari.jp/v2/entities:search"
     payload = {
         "pageSize": limit,
         "pageToken": "",
-        "searchSessionId": "",
+        "searchSessionId": str(uuid.uuid4()),   # obligatoire, doit être non-vide
         "indexRouting": "INDEX_ROUTING_UNSPECIFIED",
         "thumbnailTypes": [],
         "searchCondition": {
@@ -128,22 +167,19 @@ def fetch_mercari_items(keyword: str, limit: int = 30) -> list[dict]:
             "sort": "SORT_CREATED_TIME",
             "order": "ORDER_DESC",
             "status": ["STATUS_ON_SALE"],
-            "sizeId": [],
-            "categoryId": [],
-            "brandId": [],
-            "sellerId": [],
+            "sizeId": [], "categoryId": [], "brandId": [], "sellerId": [],
             "priceMin": MIN_PRICE if MIN_PRICE > 0 else 0,
             "priceMax": MAX_PRICE if MAX_PRICE > 0 else 0,
-            "itemConditionId": [],
-            "shippingPayerId": [],
-            "shippingFromArea": [],
-            "shippingMethod": [],
-            "colorId": [],
-            "hasCoupon": False,
-            "attributes": [],
-            "itemTypes": [],
-            "skuIds": [],
+            "itemConditionId": [], "shippingPayerId": [], "shippingFromArea": [],
+            "shippingMethod": [], "colorId": [], "hasCoupon": False,
+            "attributes": [], "itemTypes": [], "skuIds": [],
         },
+        "serviceFrom": "suruga",
+        "withItemBrand": True,
+        "withItemSize": False,
+        "withItemPromotions": True,
+        "withItemSizes": True,
+        "withShopname": False,
         "userId": "",
         "userSessionId": "",
         "fromPage": "",
@@ -151,25 +187,38 @@ def fetch_mercari_items(keyword: str, limit: int = 30) -> list[dict]:
 
     items = []
     try:
-        resp = requests.post(url, json=payload, headers=HEADERS, timeout=15)
+        resp = requests.post(
+            _SEARCH_URL,
+            json=payload,
+            headers=_api_headers(),   # DPoP régénéré à chaque appel
+            timeout=15,
+        )
         resp.raise_for_status()
         data = resp.json()
+
         for item in data.get("items", []):
-            item_id = item.get("id", "")
+            item_id = str(item.get("id", "")).strip()
             if not item_id:
                 continue
-            thumbnails = item.get("thumbnails", [])
+            thumbnails = item.get("thumbnails") or []
             image_url = thumbnails[0] if thumbnails else ""
+            try:
+                price = int(item.get("price", 0))
+            except (ValueError, TypeError):
+                price = 0
             items.append({
-                "id": item_id,
-                "name": item.get("name", ""),
-                "price": item.get("price", 0),
+                "id":        item_id,
+                "name":      item.get("name", ""),
+                "price":     price,
                 "image_url": image_url,
-                "url": f"https://jp.mercari.com/item/{item_id}",
-                "keyword": keyword,
+                "url":       f"https://jp.mercari.com/item/{item_id}",
+                "keyword":   keyword,
             })
+
     except requests.HTTPError as e:
-        log.warning(f"Mercari API erreur pour '{keyword}': {e} — {resp.text[:200]}")
+        status = getattr(e.response, "status_code", "?")
+        body   = getattr(e.response, "text", "")[:300]
+        log.warning(f"Mercari HTTP {status} pour '{keyword}': {body}")
     except Exception as e:
         log.warning(f"Erreur fetch '{keyword}': {e}")
 
