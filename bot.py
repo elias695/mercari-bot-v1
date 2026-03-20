@@ -1,9 +1,15 @@
-import os, time, json, logging, requests, re
+import os, time, json, logging, requests
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
 import imagehash
 from io import BytesIO
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -22,6 +28,19 @@ KEYWORDS = [
     "under armour running",
 ]
  
+def get_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=ja-JP")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    return webdriver.Chrome(service=service, options=options)
+ 
 def load_seen():
     if SEEN_FILE.exists():
         return set(json.loads(SEEN_FILE.read_text()))
@@ -37,7 +56,7 @@ def load_refs():
         try:
             refs.append({"path": str(f), "hash": imagehash.phash(Image.open(f).convert("RGB"))})
         except: pass
-    log.info(f"{len(refs)} images de reference chargees.")
+    log.info(f"{len(refs)} images chargees.")
     return refs
  
 def fetch_image(url):
@@ -55,59 +74,56 @@ def is_similar(img, refs, threshold):
         if d < best: best, best_ref = d, ref["path"]
     return best <= threshold, best, best_ref
  
-def search_mercari(session, keyword):
-    """Scrape Mercari JP search page and extract items from JSON embedded in HTML."""
+def search_mercari(driver, keyword):
     items = []
-    url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale&sort=created_time&order=desc"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja-JP,ja;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
     try:
-        r = session.get(url, headers=headers, timeout=20)
-        if r.status_code != 200:
-            log.warning(f"  '{keyword}' -> HTTP {r.status_code}")
-            return []
- 
-        # Extract JSON from __NEXT_DATA__ script tag
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text, re.DOTALL)
-        if not match:
-            log.warning(f"  '{keyword}' -> __NEXT_DATA__ non trouve")
-            return []
- 
-        data = json.loads(match.group(1))
+        url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale&sort=created_time&order=desc"
+        driver.get(url)
         
-        # Navigate the JSON structure to find items
-        try:
-            # Try common paths in Mercari's Next.js data
-            page_props = data.get("props", {}).get("pageProps", {})
-            
-            # Path 1: direct items
-            raw_items = page_props.get("items", [])
-            
-            # Path 2: search results
-            if not raw_items:
-                raw_items = page_props.get("searchResult", {}).get("items", [])
-            
-            # Path 3: initialState
-            if not raw_items:
-                initial = page_props.get("initialState", {})
-                raw_items = initial.get("items", {}).get("items", [])
+        # Wait for items to load
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='item-cell'], mer-item-thumbnail, li[data-location]"))
+        )
+        time.sleep(2)
+        
+        # Extract from page source JSON
+        page_source = driver.page_source
+        import re
+        match = re.search(r'"items"\s*:\s*(\[[\s\S]*?\])\s*,\s*"[a-z]', page_source)
+        if match:
+            try:
+                raw = json.loads(match.group(1))
+                for item in raw[:30]:
+                    if isinstance(item, dict) and item.get("id"):
+                        items.append({
+                            "id": str(item.get("id", "")),
+                            "name": item.get("name", ""),
+                            "price": item.get("price", 0),
+                            "image_url": (item.get("thumbnails") or [None])[0] or "",
+                            "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
+                        })
+            except: pass
+        
+        # Fallback: parse DOM elements directly
+        if not items:
+            cards = driver.find_elements(By.CSS_SELECTOR, "li[data-location], [data-testid='item-cell']")
+            for card in cards[:30]:
+                try:
+                    link = card.find_element(By.TAG_NAME, "a")
+                    href = link.get_attribute("href") or ""
+                    item_id = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
+                    name_el = card.find_elements(By.CSS_SELECTOR, "[class*='name'], [class*='title'], p")
+                    name = name_el[0].text if name_el else ""
+                    price_el = card.find_elements(By.CSS_SELECTOR, "[class*='price'], mer-price")
+                    price_text = price_el[0].text.replace("¥", "").replace(",", "").strip() if price_el else "0"
+                    price = int("".join(filter(str.isdigit, price_text))) if price_text else 0
+                    img_el = card.find_elements(By.TAG_NAME, "img")
+                    img_url = img_el[0].get_attribute("src") or "" if img_el else ""
+                    if item_id:
+                        items.append({"id": item_id, "name": name, "price": price, "image_url": img_url, "url": f"https://jp.mercari.com/item/{item_id}"})
+                except: pass
  
-            for item in raw_items[:30]:
-                items.append({
-                    "id": str(item.get("id", "")),
-                    "name": item.get("name", ""),
-                    "price": item.get("price", 0),
-                    "image_url": item.get("thumbnails", [None])[0] if item.get("thumbnails") else item.get("photo", {}).get("image_url", ""),
-                    "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
-                })
-            log.info(f"  '{keyword}' -> {len(items)} articles ✅")
-        except Exception as e:
-            log.warning(f"  '{keyword}' -> parsing erreur: {e}")
- 
+        log.info(f"  '{keyword}' -> {len(items)} articles ✅")
     except Exception as e:
         log.warning(f"  '{keyword}' -> erreur: {e}")
     return items
@@ -126,24 +142,27 @@ def notify(item, dist, ref_path, keyword):
     send_telegram(
         f"🔥 <b>Match trouve !</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"👕 <b>{item['name']}</b>\n💴 <b>{item['price']:,} ¥</b>\n"
-        f"🔍 <code>{keyword}</code>\n📊 Similarite : <b>{score}%</b>\n"
+        f"🔍 <code>{keyword}</code>\n📊 <b>{score}%</b>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>",
         image_url=item["image_url"]
     )
  
 def run():
-    log.info("=== Mercari JP Bot demarre ===")
+    log.info("=== Mercari JP Bot demarre (Selenium) ===")
     refs = load_refs()
     seen = load_seen()
-    session = requests.Session()
     
-    # Init session with Mercari homepage
-    try:
-        session.get("https://jp.mercari.com/", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36", "Accept-Language": "ja-JP,ja;q=0.9"}, timeout=15)
-        log.info("Session Mercari initialisee.")
-    except: pass
+    log.info("Lancement du navigateur Chrome...")
+    driver = get_driver()
+    log.info("Chrome lance ✅")
  
-    send_telegram(f"✅ <b>Bot demarre !</b>\n📸 {len(refs)} images\n🔎 {len(KEYWORDS)} mots-cles\n⏱ Scan toutes les {SCAN_INTERVAL//60} min\n🌐 Mode: HTML scraping")
+    send_telegram(
+        f"✅ <b>Bot demarre !</b>\n"
+        f"📸 {len(refs)} images\n"
+        f"🔎 {len(KEYWORDS)} mots-cles\n"
+        f"⏱ Scan toutes les {SCAN_INTERVAL//60} min\n"
+        f"🌐 Mode: Chrome headless ✅"
+    )
  
     scan_count = 0
     while True:
@@ -153,7 +172,7 @@ def run():
         total = 0
  
         for keyword in KEYWORDS:
-            items = search_mercari(session, keyword)
+            items = search_mercari(driver, keyword)
             total += len(items)
             for info in items:
                 if not info["id"] or info["id"] in seen: continue
@@ -163,12 +182,10 @@ def run():
                 if img is None: continue
                 matched, dist, ref_path = is_similar(img, refs, SIMILARITY_THRESHOLD)
                 if matched: notify(info, dist, ref_path, keyword)
-            time.sleep(4)
+            time.sleep(5)
  
         save_seen(seen)
-        log.info(f"Total: {total} articles | Prochain scan dans {SCAN_INTERVAL}s...")
-        if total == 0 and scan_count % 5 == 0:
-            send_telegram(f"⚠️ 0 articles trouves (scan #{scan_count}) — Mercari bloque peut-etre le scraping HTML.")
+        log.info(f"Total: {total} | Prochain scan dans {SCAN_INTERVAL}s...")
         time.sleep(SCAN_INTERVAL)
  
 if __name__ == "__main__":
