@@ -1,4 +1,4 @@
-import os, time, json, logging, requests, re
+import os, time, json, logging, requests, re, urllib.parse
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -24,24 +24,13 @@ SEEN_FILE     = Path("seen_items.json")
 MAX_PRICE     = int(os.getenv("MAX_PRICE", "0"))
 MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
 
+# Mots-clés EN japonais pour l'API
 KEYWORDS = [
     "ナイキ ランニング",
     "nike running",
     "アンダーアーマー ランニング",
     "under armour running",
 ]
-
-# Session persistante avec cookies — imite un vrai navigateur
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ja-JP,ja;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-})
 
 # ═══════════════════════════════════════════════════
 #  PERSISTANCE
@@ -67,7 +56,19 @@ def load_ref_hashes() -> list:
     files = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         files.extend(REFERENCE_DIR.glob(ext))
+
     log.info(f"{len(files)} images de référence dans '{REFERENCE_DIR.absolute()}'")
+
+    if not files:
+        # Debug complet : montre tout ce qui existe dans /app
+        for p in [Path("/app"), Path("/app/reference_images"), REFERENCE_DIR]:
+            if p.exists():
+                contents = list(p.iterdir())
+                log.warning(f"Contenu de {p}: {[x.name for x in contents[:20]]}")
+            else:
+                log.warning(f"Dossier inexistant: {p}")
+        return []
+
     hashes = []
     for f in sorted(files):
         try:
@@ -77,11 +78,13 @@ def load_ref_hashes() -> list:
             log.warning(f"Image ignorée {f.name}: {e}")
     return hashes
 
+
 def compare(img_url: str, ref_hashes: list) -> tuple:
     if not img_url or not ref_hashes:
         return 0.0, ""
     try:
-        r = SESSION.get(img_url, timeout=10)
+        r = requests.get(img_url, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         h = imagehash.phash(Image.open(BytesIO(r.content)).convert("RGB"))
         best_sim, best_ref = 0.0, ""
@@ -94,128 +97,243 @@ def compare(img_url: str, ref_hashes: list) -> tuple:
         return 0.0, ""
 
 # ═══════════════════════════════════════════════════
-#  SCRAPING MERCARI — page HTML + JSON embarqué
+#  SCRAPING MERCARI — 3 méthodes en cascade
 # ═══════════════════════════════════════════════════
 
-def init_session():
-    """Visite la page d'accueil pour obtenir les cookies nécessaires."""
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    # Initialise les cookies en visitant Mercari
     try:
-        SESSION.get("https://jp.mercari.com/", timeout=15)
-        log.info("Session initialisée (cookies ok)")
-    except Exception as e:
-        log.warning(f"Init session: {e}")
+        s.get("https://jp.mercari.com/", timeout=15)
+    except Exception:
+        pass
+    return s
+
+
+SESSION = _make_session()
+_session_hits = 0
+
+
+def _rotate_session():
+    global SESSION, _session_hits
+    SESSION = _make_session()
+    _session_hits = 0
+    log.info("Session réinitialisée")
 
 
 def fetch_items(keyword: str) -> list:
-    """
-    Scrape la page de recherche Mercari et extrait les articles
-    depuis le JSON __NEXT_DATA__ embarqué dans la page HTML.
-    """
-    import urllib.parse
-    params = {"keyword": keyword, "status": "on_sale", "sort": "created_time", "order": "desc"}
-    if MIN_PRICE > 0:
-        params["price_min"] = MIN_PRICE
-    if MAX_PRICE > 0:
-        params["price_max"] = MAX_PRICE
+    """Essaie 3 méthodes dans l'ordre jusqu'à obtenir des résultats."""
+    global _session_hits
+    _session_hits += 1
+    if _session_hits > 20:
+        _rotate_session()
 
-    url = "https://jp.mercari.com/search?" + urllib.parse.urlencode(params)
-    items = []
+    items = _method_fril(keyword)
+    if items:
+        return items
 
+    items = _method_html(keyword)
+    if items:
+        return items
+
+    items = _method_rss(keyword)
+    return items
+
+
+# ── Méthode 1 : API Fril/Mercari ancienne (souvent sans auth) ──────
+
+def _method_fril(keyword: str) -> list:
+    """
+    Utilise l'ancienne API search de Mercari compatible avec
+    les clients mobiles anciens — pas de DPoP requis.
+    """
     try:
+        params = {
+            "keyword": keyword,
+            "status": "on_sale",
+            "sort_order": "created_time:desc",
+            "limit": 30,
+        }
+        if MIN_PRICE > 0:
+            params["price_min"] = MIN_PRICE
+        if MAX_PRICE > 0:
+            params["price_max"] = MAX_PRICE
+
+        url = "https://jp.mercari.com/v1/api/search_index/items.json?" + urllib.parse.urlencode(params)
+        resp = SESSION.get(url, timeout=15)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            raw = data.get("items", data.get("data", {}).get("items", []))
+            items = [_normalize(it, keyword) for it in raw]
+            items = [x for x in items if x]
+            if items:
+                log.info(f"  [méthode 1] '{keyword}' → {len(items)} articles")
+            return items
+    except Exception as e:
+        log.debug(f"  méthode 1 échouée: {e}")
+    return []
+
+
+# ── Méthode 2 : Scraping HTML + extraction __NEXT_DATA__ ───────────
+
+def _method_html(keyword: str) -> list:
+    try:
+        params = {
+            "keyword": keyword,
+            "status": "on_sale",
+            "sort": "created_time",
+            "order": "desc",
+        }
+        if MIN_PRICE > 0:
+            params["price_min"] = MIN_PRICE
+        if MAX_PRICE > 0:
+            params["price_max"] = MAX_PRICE
+
+        url = "https://jp.mercari.com/search?" + urllib.parse.urlencode(params)
         resp = SESSION.get(url, timeout=20)
-        resp.raise_for_status()
+
+        if resp.status_code in (403, 429):
+            log.warning(f"  [méthode 2] bloqué ({resp.status_code}), pause 20s")
+            time.sleep(20)
+            _rotate_session()
+            return []
+
         html = resp.text
 
-        # Méthode 1 : extraction depuis __NEXT_DATA__ (JSON complet dans la page)
-        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', html, re.DOTALL)
+        # Tente __NEXT_DATA__
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+            html, re.DOTALL
+        )
         if m:
             try:
-                data = json.loads(m.group(1))
-                # Cherche les items dans la structure Next.js
-                items_raw = _dig(data, "props", "pageProps", "initialState", "search", "items") or \
-                            _dig(data, "props", "pageProps", "items") or \
-                            _dig(data, "props", "pageProps", "searchResult", "items") or []
-
-                for item in items_raw:
-                    parsed = _parse_item(item, keyword)
-                    if parsed:
-                        items.append(parsed)
+                nd = json.loads(m.group(1))
+                # Cherche items dans différents chemins possibles
+                raw = (
+                    _dig(nd, "props","pageProps","initialState","search","items") or
+                    _dig(nd, "props","pageProps","searchResult","items") or
+                    _dig(nd, "props","pageProps","items") or
+                    []
+                )
+                if raw:
+                    items = [_normalize(it, keyword) for it in raw]
+                    items = [x for x in items if x]
+                    log.info(f"  [méthode 2 __NEXT_DATA__] '{keyword}' → {len(items)}")
+                    return items
             except Exception as e:
-                log.debug(f"  __NEXT_DATA__ parse error: {e}")
+                log.debug(f"  __NEXT_DATA__ parse: {e}")
 
-        # Méthode 2 : fallback — extraction depuis les balises JSON-LD ou data-item
-        if not items:
-            # Cherche des patterns JSON d'items dans le HTML
-            for pattern in [
-                r'"id"\s*:\s*"(m\d+)"[^}]*"name"\s*:\s*"([^"]+)"[^}]*"price"\s*:\s*(\d+)',
-                r'"itemId"\s*:\s*"(m?\d+)"[^}]*"itemName"\s*:\s*"([^"]+)"[^}]*"price"\s*:\s*(\d+)',
-            ]:
-                for m2 in re.finditer(pattern, html):
-                    item_id = m2.group(1)
-                    if not item_id.startswith("m"):
-                        item_id = "m" + item_id
-                    items.append({
-                        "id": item_id,
-                        "name": m2.group(2),
-                        "price": int(m2.group(3)),
-                        "image_url": "",
-                        "url": f"https://jp.mercari.com/item/{item_id}",
-                        "keyword": keyword,
-                    })
-                if items:
-                    break
+        # Tente extraction regex directe dans le HTML
+        ids = re.findall(r'"id"\s*:\s*"(m\d{10,})"', html)
+        names = re.findall(r'"name"\s*:\s*"([^"]{5,80})"', html)
+        prices = re.findall(r'"price"\s*:\s*(\d+)', html)
+        thumbs = re.findall(r'"thumbnails"\s*:\s*\["([^"]+)"', html)
 
-    except requests.HTTPError as e:
-        log.warning(f"HTTP {e.response.status_code} pour '{keyword}'")
-        if e.response.status_code in (403, 429):
-            log.info("Rate limit détecté — pause 30s")
-            time.sleep(30)
-            init_session()
+        items = []
+        for i, iid in enumerate(ids[:30]):
+            items.append({
+                "id":        iid,
+                "name":      names[i] if i < len(names) else "",
+                "price":     int(prices[i]) if i < len(prices) else 0,
+                "image_url": thumbs[i] if i < len(thumbs) else "",
+                "url":       f"https://jp.mercari.com/item/{iid}",
+                "keyword":   keyword,
+            })
+        if items:
+            log.info(f"  [méthode 2 regex] '{keyword}' → {len(items)}")
+        return items
+
     except Exception as e:
-        log.warning(f"Erreur fetch '{keyword}': {e}")
+        log.debug(f"  méthode 2 échouée: {e}")
+    return []
 
-    # Déduplique par id
-    seen_ids = set()
-    unique = []
-    for it in items:
-        if it["id"] not in seen_ids:
-            seen_ids.add(it["id"])
-            unique.append(it)
 
-    log.info(f"  '{keyword}' → {len(unique)} articles")
-    return unique
+# ── Méthode 3 : RSS / sitemap Mercari ──────────────────────────────
 
+def _method_rss(keyword: str) -> list:
+    """
+    Mercari propose des flux RSS pour certaines recherches.
+    Dernier recours.
+    """
+    try:
+        url = f"https://jp.mercari.com/search/rss?keyword={urllib.parse.quote(keyword)}&status=on_sale"
+        resp = SESSION.get(url, timeout=15)
+        if resp.status_code != 200:
+            return []
+
+        # Parse le XML RSS basiquement avec regex
+        items = []
+        entries = re.findall(r'<item>(.*?)</item>', resp.text, re.DOTALL)
+        for entry in entries[:30]:
+            link  = re.search(r'<link>([^<]+)</link>', entry)
+            title = re.search(r'<title>([^<]+)</title>', entry)
+            img   = re.search(r'<img[^>]+src="([^"]+)"', entry) or \
+                    re.search(r'<enclosure[^>]+url="([^"]+)"', entry)
+
+            if not link:
+                continue
+            href   = link.group(1).strip()
+            iid    = href.rstrip("/").split("/")[-1]
+            name   = title.group(1).strip() if title else ""
+            imgurl = img.group(1).strip() if img else ""
+
+            items.append({
+                "id":        iid,
+                "name":      name,
+                "price":     0,
+                "image_url": imgurl,
+                "url":       href,
+                "keyword":   keyword,
+            })
+
+        if items:
+            log.info(f"  [méthode 3 RSS] '{keyword}' → {len(items)}")
+        return items
+
+    except Exception as e:
+        log.debug(f"  méthode 3 échouée: {e}")
+    return []
+
+
+# ── Helpers ────────────────────────────────────────────────────────
 
 def _dig(obj, *keys):
-    """Navigation sûre dans un dict imbriqué."""
     for k in keys:
+        if obj is None:
+            return None
         if isinstance(obj, dict):
             obj = obj.get(k)
-        elif isinstance(obj, list) and isinstance(k, int):
-            obj = obj[k] if k < len(obj) else None
+        elif isinstance(obj, list) and isinstance(k, int) and k < len(obj):
+            obj = obj[k]
         else:
-            return None
-        if obj is None:
             return None
     return obj
 
 
-def _parse_item(raw: dict, keyword: str) -> dict | None:
-    """Normalise un item brut depuis __NEXT_DATA__."""
-    # Plusieurs structures possibles selon la version de Mercari
-    item_id = (
-        raw.get("id") or raw.get("itemId") or raw.get("item_id") or ""
-    )
-    if not item_id:
+def _normalize(raw: dict, keyword: str) -> dict | None:
+    iid = str(raw.get("id") or raw.get("itemId") or "").strip()
+    if not iid:
         return None
-    item_id = str(item_id)
-    if not item_id.startswith("m"):
-        item_id = "m" + item_id
+    if not iid.startswith("m"):
+        iid = "m" + iid
 
-    name = raw.get("name") or raw.get("itemName") or raw.get("item_name") or ""
+    name = raw.get("name") or raw.get("itemName") or ""
 
     price = 0
-    for pk in ("price", "itemPrice", "item_price", "sellingPrice"):
+    for pk in ("price", "itemPrice", "sellingPrice"):
         v = raw.get(pk)
         if v is not None:
             try:
@@ -224,7 +342,6 @@ def _parse_item(raw: dict, keyword: str) -> dict | None:
             except (ValueError, TypeError):
                 pass
 
-    # Image — plusieurs champs possibles
     img = ""
     for ik in ("thumbnails", "photos", "images"):
         v = raw.get(ik)
@@ -238,11 +355,11 @@ def _parse_item(raw: dict, keyword: str) -> dict | None:
                 break
 
     return {
-        "id":        item_id,
+        "id":        iid,
         "name":      name,
         "price":     price,
         "image_url": img,
-        "url":       f"https://jp.mercari.com/item/{item_id}",
+        "url":       f"https://jp.mercari.com/item/{iid}",
         "keyword":   keyword,
     }
 
@@ -275,6 +392,7 @@ def send_telegram(text: str, image_url: str = ""):
             except Exception as ex:
                 log.warning(f"Telegram erreur {chat_id}: {ex}")
 
+
 def notify(item: dict, sim: float, ref: str):
     pct = f"{sim * 100:.1f}%"
     price_str = f"{item['price']:,}" if item['price'] else "—"
@@ -301,7 +419,6 @@ def run():
     log.info(f"SIMILARITY_THRESHOLD: {SIMILARITY_THRESHOLD:.2f} ({SIMILARITY_THRESHOLD*100:.0f}%)")
     log.info(f"SCAN_INTERVAL      : {SCAN_INTERVAL}s")
 
-    init_session()
     seen = load_seen()
     ref_hashes = load_ref_hashes()
 
@@ -321,11 +438,11 @@ def run():
 
         ref_hashes = load_ref_hashes()
         new_matches = 0
-        seen_this = set()
+        seen_this   = set()
 
         for keyword in KEYWORDS:
             items = fetch_items(keyword)
-            time.sleep(2)
+            time.sleep(3)  # pause polie entre chaque mot-clé
 
             for item in items:
                 iid = item["id"]
