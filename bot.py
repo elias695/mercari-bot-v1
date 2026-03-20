@@ -15,18 +15,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "8743642480:AAH5YC1X9042v80WZfNxcZhMqVWRxPJicxw")
-CHAT_IDS = ["6886739401", "2126662016", "8041785716"]  # Elias, Ami 1, Ami 2
+CHAT_IDS = ["6886739401", "2126662016", "8041785716"]
 
-SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "15"))
+# 86% similarité = distance max 9 sur 64
+SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "9"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
 REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
 SEEN_FILE        = Path("seen_items.json")
 
 KEYWORDS = [
-    "nike running",           # Nike en anglais
-    "under armour running",   # Under Armour en anglais
-    "ナイキ ランニング",          # Nike en japonais
-    "アンダーアーマー",            # Under Armour en japonais
+    "nike running",
+    "under armour running",
+    "ナイキ ランニング",
+    "アンダーアーマー",
 ]
 
 def load_seen():
@@ -70,10 +71,19 @@ def get_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=ja-JP")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--single-process")
+    options.add_argument("--memory-pressure-off")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
     options.binary_location = "/usr/bin/chromium"
     service = Service("/usr/bin/chromedriver")
     return webdriver.Chrome(service=service, options=options)
+
+def kill_driver(driver):
+    try:
+        driver.quit()
+    except: pass
 
 def search_mercari(driver, keyword):
     items = []
@@ -125,7 +135,6 @@ def search_mercari(driver, keyword):
     return items
 
 def send_telegram(text, image_url=""):
-    """Envoie à tous les destinataires."""
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     for chat_id in CHAT_IDS:
         if image_url:
@@ -150,19 +159,16 @@ def notify(item, dist, keyword):
     )
 
 def run():
-    log.info("=== Mercari JP Bot demarre (Selenium) ===")
+    log.info("=== Mercari JP Bot demarre ===")
     refs = load_refs()
     seen = load_seen()
-
-    log.info("Lancement Chrome...")
-    driver = get_driver()
-    log.info("Chrome lance ✅")
 
     send_telegram(
         f"✅ <b>Bot demarre !</b>\n"
         f"📸 {len(refs)} images de reference\n"
-        f"🔎 {len(KEYWORDS)} mots-cles surveilles\n"
+        f"🔎 {len(KEYWORDS)} mots-cles\n"
         f"👥 3 destinataires\n"
+        f"🎯 Seuil : 86% minimum\n"
         f"⏱ Scan toutes les {SCAN_INTERVAL//60} min"
     )
 
@@ -173,21 +179,26 @@ def run():
         refs = load_refs()
         total = 0
 
-        for keyword in KEYWORDS:
-            items = search_mercari(driver, keyword)
-            total += len(items)
-            for info in items:
-                if not info["id"] or info["id"] in seen: continue
-                seen.add(info["id"])
-                if not refs:
-                    notify(info, 0, keyword)
-                    continue
-                img = fetch_image(info["image_url"])
-                if img is None: continue
-                matched, dist, _ = is_similar(img, refs, SIMILARITY_THRESHOLD)
-                if matched:
-                    notify(info, dist, keyword)
-            time.sleep(5)
+        # Nouveau driver à chaque scan pour éviter les crashes mémoire
+        driver = get_driver()
+        try:
+            for keyword in KEYWORDS:
+                items = search_mercari(driver, keyword)
+                total += len(items)
+                for info in items:
+                    if not info["id"] or info["id"] in seen: continue
+                    seen.add(info["id"])
+                    if not refs:
+                        notify(info, 0, keyword)
+                        continue
+                    img = fetch_image(info["image_url"])
+                    if img is None: continue
+                    matched, dist, _ = is_similar(img, refs, SIMILARITY_THRESHOLD)
+                    if matched:
+                        notify(info, dist, keyword)
+                time.sleep(5)
+        finally:
+            kill_driver(driver)
 
         save_seen(seen)
         log.info(f"Total: {total} articles | Prochain scan dans {SCAN_INTERVAL}s...")
