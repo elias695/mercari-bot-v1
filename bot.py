@@ -10,6 +10,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import base64
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -17,18 +18,9 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "8743642480:AAH5YC1X9042v80WZfNxcZhMqVWRxPJicxw")
 CHAT_IDS = ["6886739401", "2126662016", "8041785716"]
 
-# 86% similarité = distance max 9 sur 64
-SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "9"))
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
-REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
-SEEN_FILE        = Path("seen_items.json")
-
-KEYWORDS = [
-    "nike running",
-    "under armour running",
-    "ナイキ ランニング",
-    "アンダーアーマー",
-]
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
+REFERENCE_DIR = Path(os.getenv("REFERENCE_DIR", "reference_images"))
+SEEN_FILE     = Path("seen_items.json")
 
 def load_seen():
     if SEEN_FILE.exists():
@@ -38,30 +30,13 @@ def load_seen():
 def save_seen(seen):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
-def load_refs():
-    refs = []
+def load_ref_images() -> list:
+    imgs = []
     REFERENCE_DIR.mkdir(exist_ok=True)
     for f in list(REFERENCE_DIR.glob("*.jpg")) + list(REFERENCE_DIR.glob("*.jpeg")) + list(REFERENCE_DIR.glob("*.png")):
-        try:
-            refs.append({"path": str(f), "hash": imagehash.phash(Image.open(f).convert("RGB"))})
-        except: pass
-    log.info(f"{len(refs)} images chargees.")
-    return refs
-
-def fetch_image(url):
-    try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        return Image.open(BytesIO(r.content)).convert("RGB")
-    except: return None
-
-def is_similar(img, refs, threshold):
-    if not refs: return False, 99, ""
-    h = imagehash.phash(img)
-    best, best_ref = 999, ""
-    for ref in refs:
-        d = h - ref["hash"]
-        if d < best: best, best_ref = d, ref["path"]
-    return best <= threshold, best, best_ref
+        imgs.append(f)
+    log.info(f"{len(imgs)} images de reference chargees.")
+    return imgs
 
 def get_driver():
     options = Options()
@@ -72,7 +47,6 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=ja-JP")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
     options.add_argument("--single-process")
     options.add_argument("--memory-pressure-off")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -81,57 +55,90 @@ def get_driver():
     return webdriver.Chrome(service=service, options=options)
 
 def kill_driver(driver):
-    try:
-        driver.quit()
+    try: driver.quit()
     except: pass
 
-def search_mercari(driver, keyword):
+def search_by_image(driver, image_path: Path) -> list:
+    """Upload image to Mercari JP image search and get results."""
     items = []
     try:
-        url = f"https://jp.mercari.com/search?keyword={requests.utils.quote(keyword)}&status=on_sale&sort=created_time&order=desc"
-        driver.get(url)
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='item-cell'], mer-item-thumbnail, li[data-location]"))
-        )
+        # Step 1 — Upload image via Mercari's image search API
+        with open(image_path, "rb") as f:
+            img_data = f.read()
+
+        # Get upload URL from Mercari
+        upload_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Origin": "https://jp.mercari.com",
+            "Referer": "https://jp.mercari.com/",
+            "X-Platform": "web",
+        }
+
+        # Use Selenium to navigate to search page and trigger image upload
+        driver.get("https://jp.mercari.com/")
         time.sleep(2)
 
-        page_source = driver.page_source
-        match = re.search(r'"items"\s*:\s*(\[[\s\S]*?\])\s*,\s*"[a-z]', page_source)
-        if match:
-            try:
-                raw = json.loads(match.group(1))
-                for item in raw[:30]:
-                    if isinstance(item, dict) and item.get("id"):
-                        items.append({
-                            "id": str(item.get("id", "")),
-                            "name": item.get("name", ""),
-                            "price": item.get("price", 0),
-                            "image_url": (item.get("thumbnails") or [None])[0] or "",
-                            "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
-                        })
-            except: pass
+        # Navigate to image search URL
+        driver.get("https://jp.mercari.com/search?imageSearch=true")
+        time.sleep(2)
 
-        if not items:
-            cards = driver.find_elements(By.CSS_SELECTOR, "li[data-location], [data-testid='item-cell']")
-            for card in cards[:30]:
+        # Find the file input for image upload
+        try:
+            file_input = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file'], [class*='imageSearch'] input, [data-testid*='image'] input"))
+            )
+            file_input.send_keys(str(image_path.absolute()))
+            time.sleep(3)
+
+            # Wait for results
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='item-cell'], mer-item-thumbnail, li[data-location]"))
+            )
+            time.sleep(2)
+
+            # Extract items from page
+            page_source = driver.page_source
+            match = re.search(r'"items"\s*:\s*(\[[\s\S]*?\])\s*,\s*"[a-z]', page_source)
+            if match:
                 try:
-                    link = card.find_element(By.TAG_NAME, "a")
-                    href = link.get_attribute("href") or ""
-                    item_id = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
-                    name_el = card.find_elements(By.CSS_SELECTOR, "[class*='name'], [class*='title'], p")
-                    name = name_el[0].text if name_el else ""
-                    price_el = card.find_elements(By.CSS_SELECTOR, "[class*='price'], mer-price")
-                    price_text = price_el[0].text if price_el else "0"
-                    price = int("".join(filter(str.isdigit, price_text))) if price_text else 0
-                    img_el = card.find_elements(By.TAG_NAME, "img")
-                    img_url = img_el[0].get_attribute("src") or "" if img_el else ""
-                    if item_id:
-                        items.append({"id": item_id, "name": name, "price": price, "image_url": img_url, "url": f"https://jp.mercari.com/item/{item_id}"})
+                    raw = json.loads(match.group(1))
+                    for item in raw[:20]:
+                        if isinstance(item, dict) and item.get("id"):
+                            items.append({
+                                "id": str(item.get("id", "")),
+                                "name": item.get("name", ""),
+                                "price": item.get("price", 0),
+                                "image_url": (item.get("thumbnails") or [None])[0] or "",
+                                "url": f"https://jp.mercari.com/item/{item.get('id', '')}",
+                                "ref_image": image_path.name,
+                            })
                 except: pass
 
-        log.info(f"  '{keyword}' -> {len(items)} articles")
+            if not items:
+                cards = driver.find_elements(By.CSS_SELECTOR, "li[data-location], [data-testid='item-cell']")
+                for card in cards[:20]:
+                    try:
+                        link = card.find_element(By.TAG_NAME, "a")
+                        href = link.get_attribute("href") or ""
+                        item_id = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
+                        name_el = card.find_elements(By.CSS_SELECTOR, "p, [class*='name']")
+                        name = name_el[0].text if name_el else ""
+                        price_el = card.find_elements(By.CSS_SELECTOR, "[class*='price'], mer-price")
+                        price_text = price_el[0].text if price_el else "0"
+                        price = int("".join(filter(str.isdigit, price_text))) if price_text else 0
+                        img_el = card.find_elements(By.TAG_NAME, "img")
+                        img_url = img_el[0].get_attribute("src") or "" if img_el else ""
+                        if item_id:
+                            items.append({"id": item_id, "name": name, "price": price, "image_url": img_url, "url": f"https://jp.mercari.com/item/{item_id}", "ref_image": image_path.name})
+                    except: pass
+
+        except Exception as e:
+            log.warning(f"  Upload image echoue: {e}")
+
+        log.info(f"  '{image_path.name}' -> {len(items)} articles")
     except Exception as e:
-        log.warning(f"  '{keyword}' -> erreur: {e}")
+        log.warning(f"  Erreur recherche image '{image_path.name}': {e}")
     return items
 
 def send_telegram(text, image_url=""):
@@ -146,29 +153,26 @@ def send_telegram(text, image_url=""):
             requests.post(f"{base}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
         except: pass
 
-def notify(item, dist, keyword):
-    score = max(0, 100 - int(dist * 100 / 64))
+def notify(item):
     send_telegram(
         f"🔥 <b>Match trouve !</b>\n━━━━━━━━━━━━━━━━━━\n"
         f"👕 <b>{item['name']}</b>\n"
         f"💴 <b>{item['price']:,} ¥</b>\n"
-        f"🔍 <code>{keyword}</code>\n"
-        f"📊 Similarite : <b>{score}%</b>\n"
+        f"🖼 Ref : <code>{item.get('ref_image', '')}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>",
         image_url=item["image_url"]
     )
 
 def run():
-    log.info("=== Mercari JP Bot demarre ===")
-    refs = load_refs()
+    log.info("=== Mercari JP Bot (Recherche par Image) ===")
+    ref_images = load_ref_images()
     seen = load_seen()
 
     send_telegram(
         f"✅ <b>Bot demarre !</b>\n"
-        f"📸 {len(refs)} images de reference\n"
-        f"🔎 {len(KEYWORDS)} mots-cles\n"
+        f"🖼 Mode : Recherche par IMAGE\n"
+        f"📸 {len(ref_images)} images de reference\n"
         f"👥 3 destinataires\n"
-        f"🎯 Seuil : 86% minimum\n"
         f"⏱ Scan toutes les {SCAN_INTERVAL//60} min"
     )
 
@@ -176,32 +180,24 @@ def run():
     while True:
         scan_count += 1
         log.info(f"--- Scan #{scan_count} {datetime.now().strftime('%H:%M:%S')} ---")
-        refs = load_refs()
+        ref_images = load_ref_images()
         total = 0
 
-        # Nouveau driver à chaque scan pour éviter les crashes mémoire
         driver = get_driver()
         try:
-            for keyword in KEYWORDS:
-                items = search_mercari(driver, keyword)
+            for ref_img in ref_images:
+                items = search_by_image(driver, ref_img)
                 total += len(items)
                 for info in items:
                     if not info["id"] or info["id"] in seen: continue
                     seen.add(info["id"])
-                    if not refs:
-                        notify(info, 0, keyword)
-                        continue
-                    img = fetch_image(info["image_url"])
-                    if img is None: continue
-                    matched, dist, _ = is_similar(img, refs, SIMILARITY_THRESHOLD)
-                    if matched:
-                        notify(info, dist, keyword)
-                time.sleep(5)
+                    notify(info)
+                time.sleep(3)
         finally:
             kill_driver(driver)
 
         save_seen(seen)
-        log.info(f"Total: {total} articles | Prochain scan dans {SCAN_INTERVAL}s...")
+        log.info(f"Total: {total} | Prochain scan dans {SCAN_INTERVAL}s...")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
