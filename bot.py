@@ -33,10 +33,10 @@ MAX_PRICE     = int(os.getenv("MAX_PRICE", "0"))
 MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
 
 KEYWORDS = [
-    "nike",
-    "under armour",
-    "ナイキ",
-    "アンダーアーマー",
+    "nike running",
+    "under armour running",
+    "ナイキ ランニング",
+    "アンダーアーマー ランニング",
 ]
 
 # ═══════════════════════════════════════════════════
