@@ -4,4 +4,3 @@ numpy==1.26.4
 selenium==4.18.1
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
-git+https://github.com/openai/CLIP.git
