@@ -25,11 +25,12 @@ CHAT_IDS       = [c.strip() for c in os.environ["TELEGRAM_CHAT_IDS"].split(",")]
 _raw = float(os.getenv("SIMILARITY_THRESHOLD", "0.80"))
 SIMILARITY_THRESHOLD = _raw / 100.0 if _raw > 1.0 else _raw
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
-REFERENCE_DIR = Path(os.getenv("REFERENCE_DIR", "reference_images"))
-SEEN_FILE     = Path("seen_items.json")
-MAX_PRICE     = int(os.getenv("MAX_PRICE", "0"))
-MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
+SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
+REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
+FEATURES_FILE    = Path("ref_features.npz")
+SEEN_FILE        = Path("seen_items.json")
+MAX_PRICE        = int(os.getenv("MAX_PRICE", "0"))
+MIN_PRICE        = int(os.getenv("MIN_PRICE", "0"))
 
 KEYWORDS = [
     "nike",
@@ -39,7 +40,7 @@ KEYWORDS = [
 ]
 
 # ═══════════════════════════════════════════════════
-#  DINOv2 — meilleur modèle pour comparer des produits
+#  DINOv2 — chargement rapide depuis features précalculées
 # ═══════════════════════════════════════════════════
 
 log.info("Chargement DINOv2...")
@@ -51,15 +52,12 @@ _transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# DINOv2 ViT-L/14 — le meilleur pour la comparaison de produits
 _model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
 _model.eval()
-
 log.info("DINOv2 chargé ✅")
 
 
 def extract_features(img: Image.Image) -> np.ndarray:
-    """Extrait un vecteur de features DINOv2 depuis une image PIL."""
     tensor = _transform(img).unsqueeze(0)
     with torch.no_grad():
         feat = _model(tensor).squeeze().numpy()
@@ -67,8 +65,37 @@ def extract_features(img: Image.Image) -> np.ndarray:
     return feat / norm if norm > 0 else feat
 
 
+def load_ref_features() -> list:
+    """
+    Charge les features précalculées au build.
+    Rapide : 2 secondes au lieu de 30 minutes.
+    """
+    if FEATURES_FILE.exists():
+        data = np.load(FEATURES_FILE, allow_pickle=True)
+        names = data["names"].tolist()
+        features = data["features"]
+        result = [(names[i], features[i]) for i in range(len(names))]
+        log.info(f"{len(result)} features chargées depuis le cache ✅")
+        return result
+
+    # Fallback : calcul en temps réel si le fichier n'existe pas
+    log.warning("Cache non trouvé — calcul en temps réel (lent)")
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    files = []
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+        files.extend(REFERENCE_DIR.glob(ext))
+    result = []
+    for f in sorted(files):
+        try:
+            img = Image.open(f).convert("RGB")
+            result.append((f.name, extract_features(img)))
+        except Exception as e:
+            log.warning(f"Ignorée {f.name}: {e}")
+    log.info(f"{len(result)} features calculées")
+    return result
+
+
 def compare(img_url: str, ref_features: list) -> tuple:
-    """Compare l'image d'un article avec toutes les références."""
     if not img_url or not ref_features:
         return 0.0, ""
     try:
@@ -80,7 +107,7 @@ def compare(img_url: str, ref_features: list) -> tuple:
         best_sim, best_ref = 0.0, ""
         for name, ref_f in ref_features:
             sim = float(np.dot(feat, ref_f))
-            sim = (sim + 1.0) / 2.0  # normalise en 0-1
+            sim = (sim + 1.0) / 2.0
             if sim > best_sim:
                 best_sim, best_ref = sim, name
         return best_sim, best_ref
@@ -101,26 +128,6 @@ def load_seen() -> set:
 
 def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
-
-# ═══════════════════════════════════════════════════
-#  IMAGES DE RÉFÉRENCE
-# ═══════════════════════════════════════════════════
-
-def load_ref_features() -> list:
-    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
-    files = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
-        files.extend(REFERENCE_DIR.glob(ext))
-    log.info(f"{len(files)} images de référence")
-    result = []
-    for f in sorted(files):
-        try:
-            img = Image.open(f).convert("RGB")
-            result.append((f.name, extract_features(img)))
-        except Exception as e:
-            log.warning(f"Ignorée {f.name}: {e}")
-    log.info(f"{len(result)} features DINOv2 calculées ✅")
-    return result
 
 # ═══════════════════════════════════════════════════
 #  CHROME
@@ -202,10 +209,12 @@ def fetch_items(driver, keyword: str) -> list:
                 href = link.get_attribute("href") or ""
                 iid = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
                 if not iid: continue
-                ne = card.find_elements(By.CSS_SELECTOR, "[class*='itemName'],[class*='name'],p")
+                ne = card.find_elements(By.CSS_SELECTOR,
+                    "[class*='itemName'],[class*='name'],p")
                 name = ne[0].text.strip() if ne else ""
                 pe = card.find_elements(By.CSS_SELECTOR, "[class*='price'],mer-price")
-                price = int("".join(c for c in (pe[0].text if pe else "0") if c.isdigit()) or "0")
+                price = int("".join(c for c in (pe[0].text if pe else "0")
+                                    if c.isdigit()) or "0")
                 ie = card.find_elements(By.TAG_NAME, "img")
                 img = ie[0].get_attribute("src") or "" if ie else ""
                 items.append({"id": iid, "name": name, "price": price,
@@ -320,10 +329,8 @@ def run():
         scan_count += 1
         log.info(f"─── Scan #{scan_count} · {datetime.now().strftime('%d/%m %H:%M:%S')} ───")
 
-        ref_features = load_ref_features()
         new_matches = 0
         seen_this = set()
-
         driver = None
         try:
             driver = make_driver()
