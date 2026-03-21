@@ -44,7 +44,9 @@ KEYWORDS = [
 
 log.info("Chargement du modèle CLIP...")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CLIP_MODEL, CLIP_PREPROCESS = clip.load("ViT-B/32", device=DEVICE)
+import os
+os.environ["TORCH_HOME"] = "/app/.cache/torch"
+CLIP_MODEL, CLIP_PREPROCESS = clip.load("ViT-B/32", device=DEVICE, download_root="/app/.cache/clip")
 CLIP_MODEL.eval()
 log.info(f"CLIP chargé sur {DEVICE}")
 
