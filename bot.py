@@ -1,8 +1,14 @@
-import os, time, json, logging, requests, numpy as np, re, urllib.parse
+import os, time, json, logging, requests, numpy as np, re
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
 from io import BytesIO
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import torch
 import torchvision.models as models
 import torchvision.transforms as transforms
@@ -61,9 +67,24 @@ def extract_features(img: Image.Image) -> np.ndarray:
     return feat / norm if norm > 0 else feat
 
 
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    sim = float(np.dot(a, b))
-    return (sim + 1.0) / 2.0  # ramène en 0-1
+def compare(img_url: str, ref_features: list) -> tuple:
+    if not img_url or not ref_features:
+        return 0.0, ""
+    try:
+        r = requests.get(img_url, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        feat = extract_features(img)
+        best_sim, best_ref = 0.0, ""
+        for name, ref_f in ref_features:
+            sim = float(np.dot(feat, ref_f))
+            sim = (sim + 1.0) / 2.0
+            if sim > best_sim:
+                best_sim, best_ref = sim, name
+        return best_sim, best_ref
+    except Exception:
+        return 0.0, ""
 
 # ═══════════════════════════════════════════════════
 #  PERSISTANCE
@@ -97,85 +118,70 @@ def load_ref_features() -> list:
             result.append((f.name, extract_features(img)))
         except Exception as e:
             log.warning(f"Ignorée {f.name}: {e}")
-    log.info(f"{len(result)} features calculées")
+    log.info(f"{len(result)} features calculées ✅")
     return result
 
-
-def compare(img_url: str, ref_features: list) -> tuple:
-    if not img_url or not ref_features:
-        return 0.0, ""
-    try:
-        r = requests.get(img_url, timeout=10,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        img = Image.open(BytesIO(r.content)).convert("RGB")
-        feat = extract_features(img)
-        best_sim, best_ref = 0.0, ""
-        for name, ref_f in ref_features:
-            sim = cosine_sim(feat, ref_f)
-            if sim > best_sim:
-                best_sim, best_ref = sim, name
-        return best_sim, best_ref
-    except Exception:
-        return 0.0, ""
-
 # ═══════════════════════════════════════════════════
-#  SCRAPING MERCARI — HTTP pur (pas de Chrome)
+#  CHROME
 # ═══════════════════════════════════════════════════
 
-# Session persistante avec cookies
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+def make_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=ja-JP")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--max_old_space_size=256")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ja-JP,ja;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-})
+    )
+    opts.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en']});
+            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        """
+    })
+    return driver
 
-def init_session():
-    """Visite l'accueil pour obtenir les cookies."""
-    try:
-        _session.get("https://jp.mercari.com/", timeout=15)
-        log.info("Session Mercari initialisée")
-    except Exception as e:
-        log.warning(f"Init session: {e}")
 
-
-def fetch_items(keyword: str) -> list:
-    params = {
-        "keyword": keyword,
-        "status": "on_sale",
-        "sort": "created_time",
-        "order": "desc",
-    }
+def fetch_items(driver, keyword: str) -> list:
+    import urllib.parse, json as _json
+    items = []
+    params = {"keyword": keyword, "status": "on_sale",
+               "sort": "created_time", "order": "desc"}
     if MIN_PRICE > 0: params["price_min"] = MIN_PRICE
     if MAX_PRICE > 0: params["price_max"] = MAX_PRICE
-
     url = "https://jp.mercari.com/search?" + urllib.parse.urlencode(params)
-    items = []
-
     try:
-        resp = _session.get(url, timeout=20)
+        driver.get(url)
+        try:
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR,
+                 "[data-testid='item-cell'], li[data-location], mer-item-thumbnail")))
+        except Exception:
+            pass
+        time.sleep(2)
+        html = driver.page_source
 
-        if resp.status_code in (403, 429):
-            log.warning(f"  Bloqué ({resp.status_code}) — pause 30s")
-            time.sleep(30)
-            init_session()
-            return []
-
-        html = resp.text
-
-        # Extraction depuis __NEXT_DATA__
+        # Méthode 1 : __NEXT_DATA__
         m = re.search(
             r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
             html, re.DOTALL)
         if m:
             try:
-                nd = json.loads(m.group(1))
+                nd = _json.loads(m.group(1))
                 raw = (
                     _dig(nd,"props","pageProps","initialState","search","items") or
                     _dig(nd,"props","pageProps","searchResult","items") or
@@ -185,35 +191,38 @@ def fetch_items(keyword: str) -> list:
                     p = _norm(it, keyword)
                     if p: items.append(p)
                 if items:
-                    log.info(f"  '{keyword}' → {len(items)} articles")
+                    log.info(f"  [NEXT] '{keyword}' → {len(items)}")
                     return items
-            except Exception as e:
-                log.debug(f"  NEXT_DATA: {e}")
+            except Exception:
+                pass
 
-        # Fallback regex
-        ids = re.findall(r'"id"\s*:\s*"(m\d{10,})"', html)
-        thumbs = re.findall(r'"thumbnails"\s*:\s*\["([^"]+)"', html)
-        names = re.findall(r'"name"\s*:\s*"([^"]{5,60})"', html)
-        prices = re.findall(r'"price"\s*:\s*(\d+)', html)
+        # Méthode 2 : DOM
+        cards = driver.find_elements(By.CSS_SELECTOR,
+            "li[data-location], [data-testid='item-cell'], mer-item-thumbnail")
+        for card in cards[:30]:
+            try:
+                link = card.find_element(By.TAG_NAME, "a")
+                href = link.get_attribute("href") or ""
+                iid = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
+                if not iid: continue
+                ne = card.find_elements(By.CSS_SELECTOR, "[class*='itemName'],[class*='name'],p")
+                name = ne[0].text.strip() if ne else ""
+                pe = card.find_elements(By.CSS_SELECTOR, "[class*='price'],mer-price")
+                price = int("".join(c for c in (pe[0].text if pe else "0") if c.isdigit()) or "0")
+                ie = card.find_elements(By.TAG_NAME, "img")
+                img = ie[0].get_attribute("src") or "" if ie else ""
+                items.append({"id": iid, "name": name, "price": price,
+                              "image_url": img,
+                              "url": f"https://jp.mercari.com/item/{iid}",
+                              "keyword": keyword})
+            except Exception:
+                continue
 
-        for i, iid in enumerate(ids[:30]):
-            items.append({
-                "id": iid,
-                "name": names[i] if i < len(names) else "",
-                "price": int(prices[i]) if i < len(prices) else 0,
-                "image_url": thumbs[i] if i < len(thumbs) else "",
-                "url": f"https://jp.mercari.com/item/{iid}",
-                "keyword": keyword,
-            })
-
-        if items:
-            log.info(f"  '{keyword}' → {len(items)} articles (regex)")
-        else:
-            log.warning(f"  '{keyword}' → 0 articles")
+        if items: log.info(f"  [DOM] '{keyword}' → {len(items)}")
+        else: log.warning(f"  '{keyword}' → 0 articles")
 
     except Exception as e:
-        log.warning(f"  fetch '{keyword}': {e}")
-
+        log.warning(f"  Selenium '{keyword}': {e}")
     return items
 
 
@@ -293,16 +302,15 @@ def notify(item, sim, ref):
 # ═══════════════════════════════════════════════════
 
 def run():
-    log.info("=== Mercari JP Bot (MobileNetV2 + HTTP) ===")
+    log.info("=== Mercari JP Bot (MobileNetV2 + Chrome) ===")
     log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s")
 
-    init_session()
     seen = load_seen()
     ref_features = load_ref_features()
 
     send_telegram(
         f"✅ <b>Bot démarré !</b>\n"
-        f"🧠 Mode : <b>MobileNetV2 IA</b>\n"
+        f"🧠 Mode : <b>MobileNetV2 IA + Chrome</b>\n"
         f"📸 <b>{len(ref_features)}</b> images de référence\n"
         f"🔍 <b>{len(KEYWORDS)}</b> mots-clés\n"
         f"📊 Seuil : <b>{SIMILARITY_THRESHOLD*100:.0f}%</b>\n"
@@ -319,23 +327,32 @@ def run():
         new_matches = 0
         seen_this = set()
 
-        for keyword in KEYWORDS:
-            items = fetch_items(keyword)
-            time.sleep(2)
+        driver = None
+        try:
+            driver = make_driver()
+            driver.get("https://jp.mercari.com/")
+            time.sleep(3)
 
-            for item in items:
-                iid = item["id"]
-                if iid in seen or iid in seen_this: continue
-                seen_this.add(iid)
-                seen.add(iid)
-                if not ref_features: continue
+            for keyword in KEYWORDS:
+                items = fetch_items(driver, keyword)
+                time.sleep(3)
+                for item in items:
+                    iid = item["id"]
+                    if iid in seen or iid in seen_this: continue
+                    seen_this.add(iid)
+                    seen.add(iid)
+                    if not ref_features: continue
+                    sim, ref = compare(item["image_url"], ref_features)
+                    if sim >= SIMILARITY_THRESHOLD:
+                        notify(item, sim, ref)
+                        new_matches += 1
 
-                sim, ref = compare(item["image_url"], ref_features)
-                log.debug(f"    {item['name'][:40]} sim={sim:.2f}")
-
-                if sim >= SIMILARITY_THRESHOLD:
-                    notify(item, sim, ref)
-                    new_matches += 1
+        except Exception as e:
+            log.error(f"Erreur scan: {e}")
+        finally:
+            if driver:
+                try: driver.quit()
+                except Exception: pass
 
         save_seen(seen)
         log.info(f"Scan #{scan_count} — {new_matches} match(s) — prochain dans {SCAN_INTERVAL}s")
