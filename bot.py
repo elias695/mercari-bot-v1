@@ -2,7 +2,8 @@ import os, time, json, logging, requests
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
-import imagehash
+import torch
+import clip
 from io import BytesIO
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -38,6 +39,30 @@ KEYWORDS = [
 ]
 
 # ═══════════════════════════════════════════════════
+#  CLIP — chargement du modèle IA (une seule fois)
+# ═══════════════════════════════════════════════════
+
+log.info("Chargement du modèle CLIP...")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CLIP_MODEL, CLIP_PREPROCESS = clip.load("ViT-B/32", device=DEVICE)
+CLIP_MODEL.eval()
+log.info(f"CLIP chargé sur {DEVICE}")
+
+
+def encode_image(img: Image.Image) -> torch.Tensor:
+    """Encode une image PIL en vecteur CLIP normalisé."""
+    with torch.no_grad():
+        tensor = CLIP_PREPROCESS(img).unsqueeze(0).to(DEVICE)
+        features = CLIP_MODEL.encode_image(tensor)
+        features = features / features.norm(dim=-1, keepdim=True)
+    return features
+
+
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Similarité cosinus entre deux vecteurs CLIP (0 à 1)."""
+    return float((a * b).sum().item())
+
+# ═══════════════════════════════════════════════════
 #  PERSISTANCE
 # ═══════════════════════════════════════════════════
 
@@ -53,40 +78,60 @@ def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
 # ═══════════════════════════════════════════════════
-#  IMAGES DE RÉFÉRENCE
+#  IMAGES DE RÉFÉRENCE — encodées avec CLIP
 # ═══════════════════════════════════════════════════
 
-def load_ref_hashes() -> list:
+def load_ref_embeddings() -> list:
+    """
+    Charge toutes les images de référence et calcule leur
+    embedding CLIP une seule fois (mis en cache en mémoire).
+    """
     REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
     files = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         files.extend(REFERENCE_DIR.glob(ext))
-    log.info(f"{len(files)} images de référence")
-    hashes = []
+
+    log.info(f"{len(files)} images de référence trouvées")
+    embeddings = []
     for f in sorted(files):
         try:
             img = Image.open(f).convert("RGB")
-            hashes.append((f.name, imagehash.phash(img)))
+            emb = encode_image(img)
+            embeddings.append((f.name, emb))
         except Exception as e:
             log.warning(f"Image ignorée {f.name}: {e}")
-    return hashes
 
-def compare(img_url: str, ref_hashes: list) -> tuple:
-    if not img_url or not ref_hashes:
+    log.info(f"{len(embeddings)} embeddings CLIP calculés")
+    return embeddings
+
+
+def compare_clip(img_url: str, ref_embeddings: list) -> tuple:
+    """
+    Télécharge l'image de l'article, calcule son embedding CLIP,
+    et le compare avec tous les embeddings de référence.
+    Retourne (meilleure_similarité, nom_image_ref).
+    """
+    if not img_url or not ref_embeddings:
         return 0.0, ""
     try:
         r = requests.get(img_url, timeout=10,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        h = imagehash.phash(Image.open(BytesIO(r.content)).convert("RGB"))
-        best_sim, best_ref = 0.0, ""
-        for name, ref_h in ref_hashes:
-            sim = 1.0 - (h - ref_h) / 64.0
-            if sim > best_sim:
-                best_sim, best_ref = sim, name
-        return best_sim, best_ref
-    except Exception:
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        item_emb = encode_image(img)
+    except Exception as e:
+        log.debug(f"Image non chargeable {img_url}: {e}")
         return 0.0, ""
+
+    best_sim, best_ref = 0.0, ""
+    for ref_name, ref_emb in ref_embeddings:
+        sim = cosine_similarity(item_emb, ref_emb)
+        # CLIP cosine est entre -1 et 1, on normalise en 0-1
+        sim_normalized = (sim + 1.0) / 2.0
+        if sim_normalized > best_sim:
+            best_sim, best_ref = sim_normalized, ref_name
+
+    return best_sim, best_ref
 
 # ═══════════════════════════════════════════════════
 #  CHROME / SELENIUM
@@ -111,7 +156,6 @@ def make_driver():
     opts.binary_location = "/usr/bin/chromium"
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=opts)
-    # Cache le fait que c'est Selenium
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": """
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -126,8 +170,12 @@ def fetch_items_selenium(driver, keyword: str) -> list:
     import urllib.parse, re, json as _json
     items = []
 
-    params = {"keyword": keyword, "status": "on_sale",
-               "sort": "created_time", "order": "desc"}
+    params = {
+        "keyword": keyword,
+        "status": "on_sale",
+        "sort": "created_time",
+        "order": "desc",
+    }
     if MIN_PRICE > 0:
         params["price_min"] = MIN_PRICE
     if MAX_PRICE > 0:
@@ -137,20 +185,18 @@ def fetch_items_selenium(driver, keyword: str) -> list:
 
     try:
         driver.get(url)
-        # Attend que la page charge (attend qu'un élément article apparaisse)
         try:
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR,
                     "[data-testid='item-cell'], li[data-location], mer-item-thumbnail"))
             )
         except Exception:
-            pass  # Continue même si timeout — on essaie quand même d'extraire
-
-        time.sleep(2)  # Laisse le JS s'exécuter
+            pass
+        time.sleep(2)
 
         html = driver.page_source
 
-        # Extraction depuis __NEXT_DATA__
+        # Méthode 1 : __NEXT_DATA__
         m = re.search(
             r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
             html, re.DOTALL
@@ -161,20 +207,19 @@ def fetch_items_selenium(driver, keyword: str) -> list:
                 raw = (
                     _dig(nd, "props","pageProps","initialState","search","items") or
                     _dig(nd, "props","pageProps","searchResult","items") or
-                    _dig(nd, "props","pageProps","items") or
-                    []
+                    _dig(nd, "props","pageProps","items") or []
                 )
                 for it in raw:
                     parsed = _normalize(it, keyword)
                     if parsed:
                         items.append(parsed)
                 if items:
-                    log.info(f"  [__NEXT_DATA__] '{keyword}' → {len(items)}")
+                    log.info(f"  [NEXT_DATA] '{keyword}' → {len(items)}")
                     return items
             except Exception as e:
-                log.debug(f"  __NEXT_DATA__ parse: {e}")
+                log.debug(f"  NEXT_DATA parse: {e}")
 
-        # Fallback : extraction DOM directe
+        # Méthode 2 : DOM
         cards = driver.find_elements(By.CSS_SELECTOR,
             "li[data-location], [data-testid='item-cell'], mer-item-thumbnail")
         for card in cards[:30]:
@@ -184,26 +229,20 @@ def fetch_items_selenium(driver, keyword: str) -> list:
                 item_id = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
                 if not item_id:
                     continue
-
                 name_els = card.find_elements(By.CSS_SELECTOR,
                     "[class*='itemName'], [class*='name'], p")
                 name = name_els[0].text.strip() if name_els else ""
-
                 price_els = card.find_elements(By.CSS_SELECTOR,
-                    "[class*='price'], mer-price, [class*='Price']")
+                    "[class*='price'], mer-price")
                 price_text = price_els[0].text if price_els else "0"
                 price = int("".join(c for c in price_text if c.isdigit()) or "0")
-
                 img_els = card.find_elements(By.TAG_NAME, "img")
                 img_url = img_els[0].get_attribute("src") or "" if img_els else ""
-
                 items.append({
-                    "id":        item_id,
-                    "name":      name,
-                    "price":     price,
+                    "id": item_id, "name": name, "price": price,
                     "image_url": img_url,
-                    "url":       f"https://jp.mercari.com/item/{item_id}",
-                    "keyword":   keyword,
+                    "url": f"https://jp.mercari.com/item/{item_id}",
+                    "keyword": keyword,
                 })
             except Exception:
                 continue
@@ -211,10 +250,10 @@ def fetch_items_selenium(driver, keyword: str) -> list:
         if items:
             log.info(f"  [DOM] '{keyword}' → {len(items)}")
         else:
-            log.warning(f"  '{keyword}' → 0 articles (page bloquée ?)")
+            log.warning(f"  '{keyword}' → 0 articles")
 
     except Exception as e:
-        log.warning(f"  Selenium erreur '{keyword}': {e}")
+        log.warning(f"  Selenium '{keyword}': {e}")
 
     return items
 
@@ -285,6 +324,7 @@ def send_telegram(text: str, image_url: str = ""):
             except Exception as ex:
                 log.warning(f"Telegram erreur {chat_id}: {ex}")
 
+
 def notify(item: dict, sim: float, ref: str):
     pct = f"{sim * 100:.1f}%"
     price_str = f"{item['price']:,}" if item['price'] else "—"
@@ -294,7 +334,7 @@ def notify(item: dict, sim: float, ref: str):
         f"👕 <b>{item['name']}</b>\n"
         f"💴 <b>{price_str} ¥</b>\n"
         f"🔍 Mot-clé : <i>{item['keyword']}</i>\n"
-        f"📊 Similarité : <b>{pct}</b>\n"
+        f"📊 Similarité CLIP : <b>{pct}</b>\n"
         f"🖼 Référence : <code>{ref}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>"
     )
@@ -306,17 +346,19 @@ def notify(item: dict, sim: float, ref: str):
 # ═══════════════════════════════════════════════════
 
 def run():
-    log.info("=== Mercari JP Bot (Chrome) ===")
+    log.info("=== Mercari JP Bot (CLIP + Chrome) ===")
     log.info(f"SIMILARITY_THRESHOLD: {SIMILARITY_THRESHOLD:.2f} ({SIMILARITY_THRESHOLD*100:.0f}%)")
     log.info(f"SCAN_INTERVAL: {SCAN_INTERVAL}s")
 
-    seen      = load_seen()
-    ref_hashes = load_ref_hashes()
+    seen = load_seen()
+
+    # Charge les embeddings CLIP une fois au démarrage
+    ref_embeddings = load_ref_embeddings()
 
     send_telegram(
         f"✅ <b>Bot démarré !</b>\n"
-        f"🌐 Mode : <b>Chrome headless</b>\n"
-        f"📸 <b>{len(ref_hashes)}</b> images de référence\n"
+        f"🧠 Mode : <b>CLIP IA</b>\n"
+        f"📸 <b>{len(ref_embeddings)}</b> images de référence\n"
         f"🔍 <b>{len(KEYWORDS)}</b> mots-clés\n"
         f"📊 Seuil : <b>{SIMILARITY_THRESHOLD * 100:.0f}%</b>\n"
         f"👥 <b>{len(CHAT_IDS)}</b> destinataire(s)\n"
@@ -328,15 +370,12 @@ def run():
         scan_count += 1
         log.info(f"─── Scan #{scan_count} · {datetime.now().strftime('%d/%m %H:%M:%S')} ───")
 
-        ref_hashes = load_ref_hashes()
         new_matches = 0
         seen_this   = set()
 
-        # Un driver Chrome par scan (plus stable que le garder entre scans)
         driver = None
         try:
             driver = make_driver()
-            # Visite la page d'accueil d'abord pour avoir les cookies
             driver.get("https://jp.mercari.com/")
             time.sleep(3)
 
@@ -351,10 +390,10 @@ def run():
                     seen_this.add(iid)
                     seen.add(iid)
 
-                    if not ref_hashes:
+                    if not ref_embeddings:
                         continue
 
-                    sim, ref = compare(item["image_url"], ref_hashes)
+                    sim, ref = compare_clip(item["image_url"], ref_embeddings)
                     log.debug(f"    {item['name'][:40]} sim={sim:.2f}")
 
                     if sim >= SIMILARITY_THRESHOLD:
