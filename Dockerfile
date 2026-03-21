@@ -27,13 +27,11 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch CPU
 RUN pip install --no-cache-dir \
     torch==2.2.2+cpu \
     torchvision==0.17.2+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
-# Autres dépendances
 RUN pip install --no-cache-dir \
     requests==2.31.0 \
     Pillow==10.3.0 \
@@ -41,24 +39,16 @@ RUN pip install --no-cache-dir \
     selenium==4.18.1 \
     ftfy regex tqdm
 
-# CLIP
 RUN pip install --no-cache-dir git+https://github.com/openai/CLIP.git
+
+ENV TORCH_HOME=/app/.cache/torch
+ENV CLIP_CACHE=/app/.cache/clip
+
+COPY preload_clip.py .
+RUN python3 preload_clip.py
 
 COPY bot.py .
 COPY reference_images/ ./reference_images/
-
-# Pré-télécharge le modèle CLIP dans le cache Docker
-# Le modèle est stocké dans /root/.cache/clip/
-ENV TORCH_HOME=/app/.cache/torch
-ENV CLIP_CACHE=/app/.cache/clip
-RUN python3 -c "
-import os
-os.environ['TORCH_HOME'] = '/app/.cache/torch'
-import clip
-print('Téléchargement modèle CLIP ViT-B/32...')
-model, preprocess = clip.load('ViT-B/32', device='cpu', download_root='/app/.cache/clip')
-print('Modèle CLIP téléchargé et mis en cache OK')
-"
 
 RUN echo "Images:" && ls /app/reference_images/ | wc -l
 
