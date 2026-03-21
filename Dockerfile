@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     libx11-6 libxcb1 libxcomposite1 libxcursor1 \
     libxdamage1 libxext6 libxfixes3 libxi6 \
     libxrandr2 libxrender1 libxss1 libxtst6 \
-    fonts-noto-cjk \
+    fonts-noto-cjk git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
