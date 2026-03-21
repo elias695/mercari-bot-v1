@@ -10,7 +10,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import torch
-import torchvision.models as models
 import torchvision.transforms as transforms
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -34,38 +33,42 @@ MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
 
 KEYWORDS = [
     "nike",
+    "under armour",
+    "ナイキ",
     "アンダーアーマー",
 ]
 
 # ═══════════════════════════════════════════════════
-#  MOBILENETV2
+#  DINOv2 — meilleur modèle pour comparer des produits
 # ═══════════════════════════════════════════════════
 
-log.info("Chargement MobileNetV2...")
+log.info("Chargement DINOv2...")
 
 _transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((518, 518)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225]),
 ])
 
-_base = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
-_base.classifier = torch.nn.Identity()
-_base.eval()
+# DINOv2 ViT-L/14 — le meilleur pour la comparaison de produits
+_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+_model.eval()
 
-log.info("MobileNetV2 chargé ✅")
+log.info("DINOv2 chargé ✅")
 
 
 def extract_features(img: Image.Image) -> np.ndarray:
+    """Extrait un vecteur de features DINOv2 depuis une image PIL."""
     tensor = _transform(img).unsqueeze(0)
     with torch.no_grad():
-        feat = _base(tensor).squeeze().numpy()
+        feat = _model(tensor).squeeze().numpy()
     norm = np.linalg.norm(feat)
     return feat / norm if norm > 0 else feat
 
 
 def compare(img_url: str, ref_features: list) -> tuple:
+    """Compare l'image d'un article avec toutes les références."""
     if not img_url or not ref_features:
         return 0.0, ""
     try:
@@ -77,7 +80,7 @@ def compare(img_url: str, ref_features: list) -> tuple:
         best_sim, best_ref = 0.0, ""
         for name, ref_f in ref_features:
             sim = float(np.dot(feat, ref_f))
-            sim = (sim + 1.0) / 2.0
+            sim = (sim + 1.0) / 2.0  # normalise en 0-1
             if sim > best_sim:
                 best_sim, best_ref = sim, name
         return best_sim, best_ref
@@ -116,7 +119,7 @@ def load_ref_features() -> list:
             result.append((f.name, extract_features(img)))
         except Exception as e:
             log.warning(f"Ignorée {f.name}: {e}")
-    log.info(f"{len(result)} features calculées ✅")
+    log.info(f"{len(result)} features DINOv2 calculées ✅")
     return result
 
 # ═══════════════════════════════════════════════════
@@ -132,8 +135,6 @@ def make_driver():
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--lang=ja-JP")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--memory-pressure-off")
-    opts.add_argument("--max_old_space_size=256")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(
@@ -173,7 +174,6 @@ def fetch_items(driver, keyword: str) -> list:
         time.sleep(2)
         html = driver.page_source
 
-        # Méthode 1 : __NEXT_DATA__
         m = re.search(
             r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
             html, re.DOTALL)
@@ -194,7 +194,6 @@ def fetch_items(driver, keyword: str) -> list:
             except Exception:
                 pass
 
-        # Méthode 2 : DOM
         cards = driver.find_elements(By.CSS_SELECTOR,
             "li[data-location], [data-testid='item-cell'], mer-item-thumbnail")
         for card in cards[:30]:
@@ -220,7 +219,7 @@ def fetch_items(driver, keyword: str) -> list:
         else: log.warning(f"  '{keyword}' → 0 articles")
 
     except Exception as e:
-        log.warning(f"  Selenium '{keyword}': {e}")
+        log.warning(f"  Chrome '{keyword}': {e}")
     return items
 
 
@@ -288,7 +287,7 @@ def notify(item, sim, ref):
         f"👕 <b>{item['name']}</b>\n"
         f"💴 <b>{price_str} ¥</b>\n"
         f"🔍 Mot-clé : <i>{item['keyword']}</i>\n"
-        f"📊 Similarité IA : <b>{pct}</b>\n"
+        f"📊 Similarité DINOv2 : <b>{pct}</b>\n"
         f"🖼 Référence : <code>{ref}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>"
     )
@@ -300,7 +299,7 @@ def notify(item, sim, ref):
 # ═══════════════════════════════════════════════════
 
 def run():
-    log.info("=== Mercari JP Bot (MobileNetV2 + Chrome) ===")
+    log.info("=== Mercari JP Bot (DINOv2 + Chrome) ===")
     log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s")
 
     seen = load_seen()
@@ -308,7 +307,7 @@ def run():
 
     send_telegram(
         f"✅ <b>Bot démarré !</b>\n"
-        f"🧠 Mode : <b>MobileNetV2 IA + Chrome</b>\n"
+        f"🧠 Mode : <b>DINOv2 IA</b>\n"
         f"📸 <b>{len(ref_features)}</b> images de référence\n"
         f"🔍 <b>{len(KEYWORDS)}</b> mots-clés\n"
         f"📊 Seuil : <b>{SIMILARITY_THRESHOLD*100:.0f}%</b>\n"
