@@ -25,12 +25,13 @@ CHAT_IDS       = [c.strip() for c in os.environ["TELEGRAM_CHAT_IDS"].split(",")]
 _raw = float(os.getenv("SIMILARITY_THRESHOLD", "0.80"))
 SIMILARITY_THRESHOLD = _raw / 100.0 if _raw > 1.0 else _raw
 
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "120"))
-REFERENCE_DIR    = Path(os.getenv("REFERENCE_DIR", "reference_images"))
-FEATURES_FILE    = Path("ref_features.npz")
-SEEN_FILE        = Path("seen_items.json")
-MAX_PRICE        = int(os.getenv("MAX_PRICE", "0"))
-MIN_PRICE        = int(os.getenv("MIN_PRICE", "0"))
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", "120"))        # scan mots-clés
+IMAGE_SEARCH_INTERVAL = int(os.getenv("IMAGE_SEARCH_INTERVAL", "3600"))  # recherche par image
+
+REFERENCE_DIR = Path(os.getenv("REFERENCE_DIR", "reference_images"))
+SEEN_FILE     = Path("seen_items.json")
+MAX_PRICE     = int(os.getenv("MAX_PRICE", "0"))
+MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
 
 KEYWORDS = [
     "nike",
@@ -40,7 +41,7 @@ KEYWORDS = [
 ]
 
 # ═══════════════════════════════════════════════════
-#  DINOv2 — chargement rapide depuis features précalculées
+#  DINOv2
 # ═══════════════════════════════════════════════════
 
 log.info("Chargement DINOv2...")
@@ -63,36 +64,6 @@ def extract_features(img: Image.Image) -> np.ndarray:
         feat = _model(tensor).squeeze().numpy()
     norm = np.linalg.norm(feat)
     return feat / norm if norm > 0 else feat
-
-
-def load_ref_features() -> list:
-    """
-    Charge les features précalculées au build.
-    Rapide : 2 secondes au lieu de 30 minutes.
-    """
-    if FEATURES_FILE.exists():
-        data = np.load(FEATURES_FILE, allow_pickle=True)
-        names = data["names"].tolist()
-        features = data["features"]
-        result = [(names[i], features[i]) for i in range(len(names))]
-        log.info(f"{len(result)} features chargées depuis le cache ✅")
-        return result
-
-    # Fallback : calcul en temps réel si le fichier n'existe pas
-    log.warning("Cache non trouvé — calcul en temps réel (lent)")
-    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
-    files = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
-        files.extend(REFERENCE_DIR.glob(ext))
-    result = []
-    for f in sorted(files):
-        try:
-            img = Image.open(f).convert("RGB")
-            result.append((f.name, extract_features(img)))
-        except Exception as e:
-            log.warning(f"Ignorée {f.name}: {e}")
-    log.info(f"{len(result)} features calculées")
-    return result
 
 
 def compare(img_url: str, ref_features: list) -> tuple:
@@ -130,6 +101,26 @@ def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
 # ═══════════════════════════════════════════════════
+#  IMAGES DE RÉFÉRENCE
+# ═══════════════════════════════════════════════════
+
+def load_ref_features() -> list:
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    files = []
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+        files.extend(REFERENCE_DIR.glob(ext))
+    log.info(f"{len(files)} images de référence")
+    result = []
+    for f in sorted(files):
+        try:
+            img = Image.open(f).convert("RGB")
+            result.append((f.name, extract_features(img)))
+        except Exception as e:
+            log.warning(f"Ignorée {f.name}: {e}")
+    log.info(f"{len(result)} features DINOv2 calculées ✅")
+    return result
+
+# ═══════════════════════════════════════════════════
 #  CHROME
 # ═══════════════════════════════════════════════════
 
@@ -161,8 +152,11 @@ def make_driver():
     })
     return driver
 
+# ═══════════════════════════════════════════════════
+#  RECHERCHE PAR MOT-CLÉ
+# ═══════════════════════════════════════════════════
 
-def fetch_items(driver, keyword: str) -> list:
+def fetch_by_keyword(driver, keyword: str) -> list:
     import urllib.parse, json as _json
     items = []
     params = {"keyword": keyword, "status": "on_sale",
@@ -180,7 +174,6 @@ def fetch_items(driver, keyword: str) -> list:
             pass
         time.sleep(2)
         html = driver.page_source
-
         m = re.search(
             r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
             html, re.DOTALL)
@@ -200,7 +193,6 @@ def fetch_items(driver, keyword: str) -> list:
                     return items
             except Exception:
                 pass
-
         cards = driver.find_elements(By.CSS_SELECTOR,
             "li[data-location], [data-testid='item-cell'], mer-item-thumbnail")
         for card in cards[:30]:
@@ -209,12 +201,10 @@ def fetch_items(driver, keyword: str) -> list:
                 href = link.get_attribute("href") or ""
                 iid = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
                 if not iid: continue
-                ne = card.find_elements(By.CSS_SELECTOR,
-                    "[class*='itemName'],[class*='name'],p")
+                ne = card.find_elements(By.CSS_SELECTOR, "[class*='itemName'],[class*='name'],p")
                 name = ne[0].text.strip() if ne else ""
                 pe = card.find_elements(By.CSS_SELECTOR, "[class*='price'],mer-price")
-                price = int("".join(c for c in (pe[0].text if pe else "0")
-                                    if c.isdigit()) or "0")
+                price = int("".join(c for c in (pe[0].text if pe else "0") if c.isdigit()) or "0")
                 ie = card.find_elements(By.TAG_NAME, "img")
                 img = ie[0].get_attribute("src") or "" if ie else ""
                 items.append({"id": iid, "name": name, "price": price,
@@ -223,14 +213,156 @@ def fetch_items(driver, keyword: str) -> list:
                               "keyword": keyword})
             except Exception:
                 continue
-
         if items: log.info(f"  [DOM] '{keyword}' → {len(items)}")
         else: log.warning(f"  '{keyword}' → 0 articles")
-
     except Exception as e:
         log.warning(f"  Chrome '{keyword}': {e}")
     return items
 
+# ═══════════════════════════════════════════════════
+#  RECHERCHE PAR IMAGE (toutes les heures)
+# ═══════════════════════════════════════════════════
+
+def fetch_by_image(driver, image_path: Path) -> list:
+    """
+    Utilise la vraie recherche par image de Mercari JP via Chrome.
+    Upload l'image directement dans l'input file de la page.
+    """
+    items = []
+    try:
+        # Va sur la page de recherche Mercari
+        driver.get("https://jp.mercari.com/")
+        time.sleep(2)
+
+        # Cherche le bouton de recherche par image (icône appareil photo)
+        try:
+            # Essaie de trouver l'input file caché pour l'upload d'image
+            file_input = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR,
+                    "input[type='file'][accept*='image'], "
+                    "[class*='imageSearch'] input[type='file'], "
+                    "input[accept='image/*']"))
+            )
+            file_input.send_keys(str(image_path.absolute()))
+            time.sleep(4)
+
+            # Attend les résultats
+            try:
+                WebDriverWait(driver, 15).until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR,
+                     "[data-testid='item-cell'], li[data-location], mer-item-thumbnail")))
+            except Exception:
+                pass
+            time.sleep(2)
+
+        except Exception:
+            # Fallback : cherche via l'URL de recherche par image
+            driver.get("https://jp.mercari.com/search?imageSearch=true")
+            time.sleep(2)
+            try:
+                file_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']")))
+                file_input.send_keys(str(image_path.absolute()))
+                time.sleep(4)
+            except Exception as e:
+                log.debug(f"  Image search input non trouvé: {e}")
+                return []
+
+        # Extrait les résultats
+        html = driver.page_source
+        import json as _json
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+            html, re.DOTALL)
+        if m:
+            try:
+                nd = _json.loads(m.group(1))
+                raw = (
+                    _dig(nd,"props","pageProps","initialState","search","items") or
+                    _dig(nd,"props","pageProps","searchResult","items") or
+                    _dig(nd,"props","pageProps","items") or []
+                )
+                for it in raw:
+                    p = _norm(it, f"img:{image_path.name}")
+                    if p: items.append(p)
+            except Exception:
+                pass
+
+        if not items:
+            cards = driver.find_elements(By.CSS_SELECTOR,
+                "li[data-location], [data-testid='item-cell'], mer-item-thumbnail")
+            for card in cards[:20]:
+                try:
+                    link = card.find_element(By.TAG_NAME, "a")
+                    href = link.get_attribute("href") or ""
+                    iid = href.split("/item/")[-1].split("?")[0] if "/item/" in href else ""
+                    if not iid: continue
+                    ne = card.find_elements(By.CSS_SELECTOR, "[class*='itemName'],[class*='name'],p")
+                    name = ne[0].text.strip() if ne else ""
+                    pe = card.find_elements(By.CSS_SELECTOR, "[class*='price'],mer-price")
+                    price = int("".join(c for c in (pe[0].text if pe else "0") if c.isdigit()) or "0")
+                    ie = card.find_elements(By.TAG_NAME, "img")
+                    img_url = ie[0].get_attribute("src") or "" if ie else ""
+                    items.append({"id": iid, "name": name, "price": price,
+                                  "image_url": img_url,
+                                  "url": f"https://jp.mercari.com/item/{iid}",
+                                  "keyword": f"img:{image_path.name}"})
+                except Exception:
+                    continue
+
+        if items:
+            log.info(f"  [IMG] '{image_path.name}' → {len(items)} articles")
+
+    except Exception as e:
+        log.warning(f"  Recherche image '{image_path.name}': {e}")
+
+    return items
+
+
+def run_image_search(seen: set, ref_features: list) -> int:
+    """Lance la recherche par image pour toutes les images de référence."""
+    log.info("=== Recherche par IMAGE (toutes les heures) ===")
+    ref_files = []
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+        ref_files.extend(REFERENCE_DIR.glob(ext))
+
+    new_matches = 0
+    seen_this = set()
+    driver = None
+
+    try:
+        driver = make_driver()
+        driver.get("https://jp.mercari.com/")
+        time.sleep(3)
+
+        for ref_path in sorted(ref_files):
+            items = fetch_by_image(driver, ref_path)
+            time.sleep(2)
+
+            for item in items:
+                iid = item["id"]
+                if iid in seen or iid in seen_this: continue
+                seen_this.add(iid)
+                seen.add(iid)
+                if not ref_features: continue
+                sim, ref = compare(item["image_url"], ref_features)
+                if sim >= SIMILARITY_THRESHOLD:
+                    notify(item, sim, ref)
+                    new_matches += 1
+
+    except Exception as e:
+        log.error(f"Erreur recherche par image: {e}")
+    finally:
+        if driver:
+            try: driver.quit()
+            except Exception: pass
+
+    log.info(f"Recherche par image terminée — {new_matches} match(s)")
+    return new_matches
+
+# ═══════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════
 
 def _dig(obj, *keys):
     for k in keys:
@@ -290,12 +422,14 @@ def send_telegram(text: str, image_url: str = ""):
 def notify(item, sim, ref):
     pct = f"{sim*100:.1f}%"
     price_str = f"{item['price']:,}" if item['price'] else "—"
+    source = item.get('keyword', '')
+    mode = "🖼 Recherche image" if source.startswith("img:") else f"🔍 Mot-clé : <i>{source}</i>"
     msg = (
         f"🔥 <b>Match trouvé !</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👕 <b>{item['name']}</b>\n"
         f"💴 <b>{price_str} ¥</b>\n"
-        f"🔍 Mot-clé : <i>{item['keyword']}</i>\n"
+        f"{mode}\n"
         f"📊 Similarité DINOv2 : <b>{pct}</b>\n"
         f"🖼 Référence : <code>{ref}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>"
@@ -308,8 +442,8 @@ def notify(item, sim, ref):
 # ═══════════════════════════════════════════════════
 
 def run():
-    log.info("=== Mercari JP Bot (DINOv2 + Chrome) ===")
-    log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s")
+    log.info("=== Mercari JP Bot (DINOv2 + Chrome + Recherche Image) ===")
+    log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s | Image search : toutes les {IMAGE_SEARCH_INTERVAL//3600}h")
 
     seen = load_seen()
     ref_features = load_ref_features()
@@ -318,17 +452,27 @@ def run():
         f"✅ <b>Bot démarré !</b>\n"
         f"🧠 Mode : <b>DINOv2 IA</b>\n"
         f"📸 <b>{len(ref_features)}</b> images de référence\n"
-        f"🔍 <b>{len(KEYWORDS)}</b> mots-clés\n"
+        f"🔍 <b>{len(KEYWORDS)}</b> mots-clés (toutes les {SCAN_INTERVAL//60}min)\n"
+        f"🖼 Recherche par image (toutes les {IMAGE_SEARCH_INTERVAL//3600}h)\n"
         f"📊 Seuil : <b>{SIMILARITY_THRESHOLD*100:.0f}%</b>\n"
-        f"👥 <b>{len(CHAT_IDS)}</b> destinataire(s)\n"
-        f"⏱ Scan toutes les <b>{SCAN_INTERVAL//60}min</b>"
+        f"👥 <b>{len(CHAT_IDS)}</b> destinataire(s)"
     )
 
     scan_count = 0
+    last_image_search = 0  # force la recherche par image au 1er démarrage
+
     while True:
         scan_count += 1
+        now = time.time()
         log.info(f"─── Scan #{scan_count} · {datetime.now().strftime('%d/%m %H:%M:%S')} ───")
 
+        # ── Recherche par image (toutes les heures) ──
+        if now - last_image_search >= IMAGE_SEARCH_INTERVAL:
+            run_image_search(seen, ref_features)
+            save_seen(seen)
+            last_image_search = time.time()
+
+        # ── Scan par mots-clés ──
         new_matches = 0
         seen_this = set()
         driver = None
@@ -338,7 +482,7 @@ def run():
             time.sleep(3)
 
             for keyword in KEYWORDS:
-                items = fetch_items(driver, keyword)
+                items = fetch_by_keyword(driver, keyword)
                 time.sleep(3)
                 for item in items:
                     iid = item["id"]
