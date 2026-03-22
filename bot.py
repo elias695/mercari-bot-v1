@@ -1,7 +1,7 @@
 import os, time, json, logging, requests, numpy as np, re
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageFilter
 from io import BytesIO
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -25,13 +25,12 @@ CHAT_IDS       = [c.strip() for c in os.environ["TELEGRAM_CHAT_IDS"].split(",")]
 _raw = float(os.getenv("SIMILARITY_THRESHOLD", "0.80"))
 SIMILARITY_THRESHOLD = _raw / 100.0 if _raw > 1.0 else _raw
 
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", "120"))        # scan mots-clés
-IMAGE_SEARCH_INTERVAL = int(os.getenv("IMAGE_SEARCH_INTERVAL", "3600"))  # recherche par image
-
-REFERENCE_DIR = Path(os.getenv("REFERENCE_DIR", "reference_images"))
-SEEN_FILE     = Path("seen_items.json")
-MAX_PRICE     = int(os.getenv("MAX_PRICE", "0"))
-MIN_PRICE     = int(os.getenv("MIN_PRICE", "0"))
+SCAN_INTERVAL         = int(os.getenv("SCAN_INTERVAL", "120"))
+IMAGE_SEARCH_INTERVAL = int(os.getenv("IMAGE_SEARCH_INTERVAL", "3600"))
+REFERENCE_DIR         = Path(os.getenv("REFERENCE_DIR", "reference_images"))
+SEEN_FILE             = Path("seen_items.json")
+MAX_PRICE             = int(os.getenv("MAX_PRICE", "0"))
+MIN_PRICE             = int(os.getenv("MIN_PRICE", "0"))
 
 KEYWORDS = [
     "nike",
@@ -65,8 +64,88 @@ def extract_features(img: Image.Image) -> np.ndarray:
     norm = np.linalg.norm(feat)
     return feat / norm if norm > 0 else feat
 
+# ═══════════════════════════════════════════════════
+#  ROGNER LE VÊTEMENT (supprime interfaces et fonds)
+# ═══════════════════════════════════════════════════
+
+def crop_garment(img: Image.Image) -> Image.Image:
+    """
+    Détecte et rogne automatiquement le vêtement dans l'image.
+    Supprime les barres d'interface iPhone, notifications, texte parasite.
+    
+    Stratégie :
+    1. Convertit en niveaux de gris
+    2. Détecte les bandes noires/blanches uniformes en haut/bas (interface)
+    3. Rogne ces bandes
+    4. Centre sur la zone non-uniforme (le vêtement)
+    """
+    w, h = img.size
+
+    # Convertit en numpy pour analyse
+    img_array = np.array(img.convert("RGB"))
+
+    # ── Étape 1 : supprime les barres d'interface en haut et en bas ──
+    # Détecte les lignes très sombres (barres noires iPhone) ou très claires
+    gray = np.mean(img_array, axis=2)  # moyenne RGB → niveaux de gris
+
+    top_crop = 0
+    bottom_crop = h
+
+    # Cherche les bandes noires en haut (barre de statut iPhone = ~100px noirs)
+    for i in range(min(200, h)):
+        row = gray[i, :]
+        # Si la ligne est très sombre (barre noire) ou très uniforme
+        if np.mean(row) < 30 or np.std(row) < 5:
+            top_crop = i + 1
+        else:
+            break
+
+    # Cherche les bandes noires en bas
+    for i in range(h - 1, max(h - 200, 0), -1):
+        row = gray[i, :]
+        if np.mean(row) < 30 or np.std(row) < 5:
+            bottom_crop = i
+        else:
+            break
+
+    # Sécurité : si on a rognié trop, annule
+    if bottom_crop - top_crop < h * 0.5:
+        top_crop = 0
+        bottom_crop = h
+
+    img_cropped = img.crop((0, top_crop, w, bottom_crop))
+
+    # ── Étape 2 : rogne les bords blancs/uniformes (fonds unis) ──
+    img_array2 = np.array(img_cropped.convert("RGB"))
+    h2, w2 = img_array2.shape[:2]
+    gray2 = np.mean(img_array2, axis=2)
+
+    # Trouve les bords avec du contenu (std > 10 = pas uniforme)
+    col_std = np.std(img_array2, axis=0).mean(axis=1)
+    row_std = np.std(img_array2, axis=1).mean(axis=1)
+
+    threshold = 8
+    left   = next((i for i in range(w2) if col_std[i] > threshold), 0)
+    right  = next((i for i in range(w2-1, 0, -1) if col_std[i] > threshold), w2)
+    top2   = next((i for i in range(h2) if row_std[i] > threshold), 0)
+    bottom2 = next((i for i in range(h2-1, 0, -1) if row_std[i] > threshold), h2)
+
+    # Ajoute un petit padding
+    pad = 10
+    left   = max(0, left - pad)
+    right  = min(w2, right + pad)
+    top2   = max(0, top2 - pad)
+    bottom2 = min(h2, bottom2 + pad)
+
+    # Sécurité : la zone rognée doit faire au moins 30% de l'image
+    if (right - left) < w2 * 0.3 or (bottom2 - top2) < h2 * 0.3:
+        return img_cropped
+
+    return img_cropped.crop((left, top2, right, bottom2))
+
 
 def compare(img_url: str, ref_features: list) -> tuple:
+    """Compare l'image d'un article (rognée) avec toutes les références (rognées)."""
     if not img_url or not ref_features:
         return 0.0, ""
     try:
@@ -74,7 +153,9 @@ def compare(img_url: str, ref_features: list) -> tuple:
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         img = Image.open(BytesIO(r.content)).convert("RGB")
-        feat = extract_features(img)
+        img_cropped = crop_garment(img)
+        feat = extract_features(img_cropped)
+
         best_sim, best_ref = 0.0, ""
         for name, ref_f in ref_features:
             sim = float(np.dot(feat, ref_f))
@@ -101,7 +182,7 @@ def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(list(seen)))
 
 # ═══════════════════════════════════════════════════
-#  IMAGES DE RÉFÉRENCE
+#  IMAGES DE RÉFÉRENCE — rognées + encodées
 # ═══════════════════════════════════════════════════
 
 def load_ref_features() -> list:
@@ -110,14 +191,18 @@ def load_ref_features() -> list:
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         files.extend(REFERENCE_DIR.glob(ext))
     log.info(f"{len(files)} images de référence")
+
     result = []
     for f in sorted(files):
         try:
             img = Image.open(f).convert("RGB")
-            result.append((f.name, extract_features(img)))
+            img_cropped = crop_garment(img)
+            feat = extract_features(img_cropped)
+            result.append((f.name, feat))
         except Exception as e:
             log.warning(f"Ignorée {f.name}: {e}")
-    log.info(f"{len(result)} features DINOv2 calculées ✅")
+
+    log.info(f"{len(result)} features calculées (avec rognage) ✅")
     return result
 
 # ═══════════════════════════════════════════════════
@@ -152,9 +237,6 @@ def make_driver():
     })
     return driver
 
-# ═══════════════════════════════════════════════════
-#  RECHERCHE PAR MOT-CLÉ
-# ═══════════════════════════════════════════════════
 
 def fetch_by_keyword(driver, keyword: str) -> list:
     import urllib.parse, json as _json
@@ -219,34 +301,18 @@ def fetch_by_keyword(driver, keyword: str) -> list:
         log.warning(f"  Chrome '{keyword}': {e}")
     return items
 
-# ═══════════════════════════════════════════════════
-#  RECHERCHE PAR IMAGE (toutes les heures)
-# ═══════════════════════════════════════════════════
 
 def fetch_by_image(driver, image_path: Path) -> list:
-    """
-    Utilise la vraie recherche par image de Mercari JP via Chrome.
-    Upload l'image directement dans l'input file de la page.
-    """
     items = []
     try:
-        # Va sur la page de recherche Mercari
         driver.get("https://jp.mercari.com/")
         time.sleep(2)
-
-        # Cherche le bouton de recherche par image (icône appareil photo)
         try:
-            # Essaie de trouver l'input file caché pour l'upload d'image
             file_input = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR,
-                    "input[type='file'][accept*='image'], "
-                    "[class*='imageSearch'] input[type='file'], "
-                    "input[accept='image/*']"))
-            )
+                    "input[type='file'][accept*='image'], input[accept='image/*']")))
             file_input.send_keys(str(image_path.absolute()))
             time.sleep(4)
-
-            # Attend les résultats
             try:
                 WebDriverWait(driver, 15).until(EC.presence_of_element_located(
                     (By.CSS_SELECTOR,
@@ -254,23 +320,11 @@ def fetch_by_image(driver, image_path: Path) -> list:
             except Exception:
                 pass
             time.sleep(2)
-
         except Exception:
-            # Fallback : cherche via l'URL de recherche par image
-            driver.get("https://jp.mercari.com/search?imageSearch=true")
-            time.sleep(2)
-            try:
-                file_input = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']")))
-                file_input.send_keys(str(image_path.absolute()))
-                time.sleep(4)
-            except Exception as e:
-                log.debug(f"  Image search input non trouvé: {e}")
-                return []
+            return []
 
-        # Extrait les résultats
-        html = driver.page_source
         import json as _json
+        html = driver.page_source
         m = re.search(
             r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
             html, re.DOTALL)
@@ -310,18 +364,14 @@ def fetch_by_image(driver, image_path: Path) -> list:
                 except Exception:
                     continue
 
-        if items:
-            log.info(f"  [IMG] '{image_path.name}' → {len(items)} articles")
-
+        if items: log.info(f"  [IMG] '{image_path.name}' → {len(items)}")
     except Exception as e:
         log.warning(f"  Recherche image '{image_path.name}': {e}")
-
     return items
 
 
 def run_image_search(seen: set, ref_features: list) -> int:
-    """Lance la recherche par image pour toutes les images de référence."""
-    log.info("=== Recherche par IMAGE (toutes les heures) ===")
+    log.info("=== Recherche par IMAGE ===")
     ref_files = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         ref_files.extend(REFERENCE_DIR.glob(ext))
@@ -329,16 +379,13 @@ def run_image_search(seen: set, ref_features: list) -> int:
     new_matches = 0
     seen_this = set()
     driver = None
-
     try:
         driver = make_driver()
         driver.get("https://jp.mercari.com/")
         time.sleep(3)
-
         for ref_path in sorted(ref_files):
             items = fetch_by_image(driver, ref_path)
             time.sleep(2)
-
             for item in items:
                 iid = item["id"]
                 if iid in seen or iid in seen_this: continue
@@ -349,20 +396,15 @@ def run_image_search(seen: set, ref_features: list) -> int:
                 if sim >= SIMILARITY_THRESHOLD:
                     notify(item, sim, ref)
                     new_matches += 1
-
     except Exception as e:
-        log.error(f"Erreur recherche par image: {e}")
+        log.error(f"Erreur recherche image: {e}")
     finally:
         if driver:
             try: driver.quit()
             except Exception: pass
-
-    log.info(f"Recherche par image terminée — {new_matches} match(s)")
+    log.info(f"Recherche image terminée — {new_matches} match(s)")
     return new_matches
 
-# ═══════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════
 
 def _dig(obj, *keys):
     for k in keys:
@@ -423,15 +465,15 @@ def notify(item, sim, ref):
     pct = f"{sim*100:.1f}%"
     price_str = f"{item['price']:,}" if item['price'] else "—"
     source = item.get('keyword', '')
-    mode = "🖼 Recherche image" if source.startswith("img:") else f"🔍 Mot-clé : <i>{source}</i>"
+    mode = "🖼 Recherche image" if source.startswith("img:") else f"🔍 <i>{source}</i>"
     msg = (
         f"🔥 <b>Match trouvé !</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👕 <b>{item['name']}</b>\n"
         f"💴 <b>{price_str} ¥</b>\n"
         f"{mode}\n"
-        f"📊 Similarité DINOv2 : <b>{pct}</b>\n"
-        f"🖼 Référence : <code>{ref}</code>\n"
+        f"📊 Similarité : <b>{pct}</b>\n"
+        f"🖼 Réf : <code>{ref}</code>\n"
         f"🛒 <a href=\"{item['url']}\">Voir l'article</a>"
     )
     send_telegram(msg, image_url=item["image_url"])
@@ -442,37 +484,37 @@ def notify(item, sim, ref):
 # ═══════════════════════════════════════════════════
 
 def run():
-    log.info("=== Mercari JP Bot (DINOv2 + Chrome + Recherche Image) ===")
-    log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s | Image search : toutes les {IMAGE_SEARCH_INTERVAL//3600}h")
+    log.info("=== Mercari Bot v2 (DINOv2 + Rognage + Chrome) ===")
+    log.info(f"Seuil : {SIMILARITY_THRESHOLD*100:.0f}% | Scan : {SCAN_INTERVAL}s | Img search : {IMAGE_SEARCH_INTERVAL//3600}h")
 
     seen = load_seen()
     ref_features = load_ref_features()
 
     send_telegram(
-        f"✅ <b>Bot démarré !</b>\n"
-        f"🧠 Mode : <b>DINOv2 IA</b>\n"
+        f"✅ <b>Bot v2 démarré !</b>\n"
+        f"🧠 <b>DINOv2 + Rognage auto</b>\n"
         f"📸 <b>{len(ref_features)}</b> images de référence\n"
-        f"🔍 <b>{len(KEYWORDS)}</b> mots-clés (toutes les {SCAN_INTERVAL//60}min)\n"
-        f"🖼 Recherche par image (toutes les {IMAGE_SEARCH_INTERVAL//3600}h)\n"
+        f"🔍 <b>{len(KEYWORDS)}</b> mots-clés\n"
         f"📊 Seuil : <b>{SIMILARITY_THRESHOLD*100:.0f}%</b>\n"
-        f"👥 <b>{len(CHAT_IDS)}</b> destinataire(s)"
+        f"👥 <b>{len(CHAT_IDS)}</b> destinataire(s)\n"
+        f"⏱ Scan : <b>{SCAN_INTERVAL}s</b> | Image : <b>{IMAGE_SEARCH_INTERVAL//3600}h</b>"
     )
 
     scan_count = 0
-    last_image_search = 0  # force la recherche par image au 1er démarrage
+    last_image_search = 0
 
     while True:
         scan_count += 1
         now = time.time()
         log.info(f"─── Scan #{scan_count} · {datetime.now().strftime('%d/%m %H:%M:%S')} ───")
 
-        # ── Recherche par image (toutes les heures) ──
+        # Recherche par image toutes les heures
         if now - last_image_search >= IMAGE_SEARCH_INTERVAL:
             run_image_search(seen, ref_features)
             save_seen(seen)
             last_image_search = time.time()
 
-        # ── Scan par mots-clés ──
+        # Scan par mots-clés
         new_matches = 0
         seen_this = set()
         driver = None
@@ -480,7 +522,6 @@ def run():
             driver = make_driver()
             driver.get("https://jp.mercari.com/")
             time.sleep(3)
-
             for keyword in KEYWORDS:
                 items = fetch_by_keyword(driver, keyword)
                 time.sleep(3)
@@ -494,7 +535,6 @@ def run():
                     if sim >= SIMILARITY_THRESHOLD:
                         notify(item, sim, ref)
                         new_matches += 1
-
         except Exception as e:
             log.error(f"Erreur scan: {e}")
         finally:
